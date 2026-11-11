@@ -1,4 +1,4 @@
-// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
+﻿// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
 //   - Earth (R = 6371 km): NASA Blue Marble day map, Black Marble night lights, live cloud map
 //     with cloud shadows, ocean sun glint, physically based single-scattering atmosphere
 //     (Rayleigh + Mie, 100 km thick, Chapman approximation for sunlight transmittance)
@@ -127,7 +127,7 @@ float2 LatLonUV(float3 ecef)
 // ---------------------------------------------------------------------------
 // Atmosphere (single scattering)
 // ---------------------------------------------------------------------------
-// Chapman function approximation (C. Schüler): relative air mass along a ray towards zenith
+// Chapman function approximation (C. SchÃ¼ler): relative air mass along a ray towards zenith
 // angle chi, starting at normalised height h, for a planet of normalised radius X.
 float Chapman(float X, float h, float cosChi)
 {
@@ -205,27 +205,36 @@ float3 Atmosphere(float3 o, float3 d, float tMax, out float3 transmittance)
 // ---------------------------------------------------------------------------
 // Background: stars and the Sun (real angular size)
 // ---------------------------------------------------------------------------
+// Point-like stars sized to the pixel (no shimmer), with a steep magnitude distribution:
+// many faint stars, a few bright ones, denser along the Milky Way band.
 float3 Stars(float3 d)
 {
+    float pixelAngle = 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
+    float sigma = max(pixelAngle * 0.6f, 1e-5f);
+    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 30.0f);   // galactic plane
     float3 col = 0;
-    const float scales[2] = { 220.0f, 520.0f };
+    const float scales[3] = { 90.0f, 200.0f, 420.0f };
+    const float density[3] = { 0.02f, 0.035f, 0.05f };
+    const float gain[3] = { 50.0f, 18.0f, 6.0f };
     [unroll]
-    for (int l = 0; l < 2; l++)
+    for (int l = 0; l < 3; l++)
     {
         float3 p = d * scales[l];
         float3 cell = floor(p);
-        float3 f = frac(p) - 0.5f;
         float h = Hash31(cell);
-        if (h > 0.975f)
+        float thr = 1.0f - density[l] * (1.0f + 2.5f * band);
+        if (h > thr)
         {
-            float3 off = (float3(Hash31(cell + 1.3f), Hash31(cell + 2.7f), Hash31(cell + 4.1f)) - 0.5f) * 0.6f;
-            float b = smoothstep(0.16f, 0.0f, length(f - off)) * (h - 0.975f) / 0.025f;
-            float3 tint = lerp(float3(0.65f, 0.75f, 1.0f), float3(1.0f, 0.85f, 0.65f), Hash31(cell + 9.0f));
-            col += tint * b * b * (l == 0 ? 2.5f : 1.0f);
+            float3 off = float3(Hash31(cell + 1.3f), Hash31(cell + 2.7f), Hash31(cell + 4.1f)) * 0.8f + 0.1f;
+            float3 star = normalize((cell + off) / scales[l]);
+            float a = acos(clamp(dot(d, star), -1.0f, 1.0f));
+            float mag = pow(Hash31(cell + 5.9f), 6.0f);                      // steep: few bright stars
+            float b = exp(-(a * a) / (sigma * sigma)) * mag * gain[l];
+            float3 tint = lerp(float3(0.7f, 0.8f, 1.0f), float3(1.0f, 0.88f, 0.7f), Hash31(cell + 9.0f));
+            col += tint * b;
         }
     }
-    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 45.0f);
-    col += float3(0.05f, 0.045f, 0.07f) * band * smoothstep(0.55f, 0.85f, Fbm3(d * 14.0f, 4)) * 0.12f;
+    col += float3(0.010f, 0.010f, 0.016f) * band;   // faint, smooth unresolved glow (no noise blotches)
     return col;
 }
 

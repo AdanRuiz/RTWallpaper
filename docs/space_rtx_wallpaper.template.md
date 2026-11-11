@@ -18,7 +18,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 | R5 | Velocidad de los satélites real respecto al planeta dibujado | Todo se dibuja en **kilómetros**: Tierra de 6371 km y satélites a su altitud real. Las órbitas salen de los **TLE actuales de Celestrak** (ISS y Hubble), propagadas con Kepler + J2 en doble precisión y con el reloj UTC real. |
 | R6 | Distancia Sol–Tierra realista | Efemérides solares (Almanaque Astronómico): distancia de **0.983–1.017 UA (≈ 23 000 radios terrestres)** según la fecha, con el tamaño angular real (0.53°). |
 | R7 | La pantalla muestra el 40–60 % del planeta | La cámara busca cada frame la inclinación con la que el disco terrestre cubre la fracción objetivo de la pantalla (cuadrícula de 48×27 rayos y búsqueda binaria). El objetivo oscila entre `CoverageMin` y `CoverageMax` con el movimiento del observador. |
-| R8 | Rotación terrestre y cámara cinemática | La Tierra gira según el GMST real, así que el lado iluminado coincide con el de este momento. El observador sigue la órbita de la ISS desde más alto (entre 2000 y 5200 km de altitud), con desfase y desplazamiento lateral variables. |
+| R8 | Rotación terrestre y cámara cinemática | La Tierra gira según el GMST real, así que el lado iluminado coincide con el de este momento. El observador empieza estacionado sobre **México** (configurable), girando con la Tierra, y tras `FocusMinutes` pasa suavemente a seguir la órbita de la ISS desde más alto (entre 2000 y 5200 km de altitud). |
 
 ## 2. Escala física (verificada)
 
@@ -61,11 +61,16 @@ Sin conexión (o con `Offline=1`) usa la caché. Si tampoco hay caché, dibuja u
 
 ## 5. Cámara (observador)
 
-1. **Punto base:** la dirección de la ISS, limitada a 78° del punto subsolar. Mientras la ISS está de día el observador la sigue; cuando entra en la noche, espera junto al terminador, donde siguen viéndose las nubes reales.
+0. **Inicio sobre México:** durante los primeros `FocusMinutes` (20 por defecto) el observador está entre 9° y 15° al sur de `FocusLat`/`FocusLon` (23.6° N, 102.5° O), con un vaivén lateral de ±30°, y mira hacia el norte con el horizonte al fondo. Gira con la Tierra, así que México no sale de la vista: se ve de día con las nubes reales y de noche con las luces de sus ciudades. Después pasa en 3 minutos al modo de seguimiento. Con `FocusMinutes=-1` se queda siempre sobre ese punto.
+1. **Punto base (seguimiento):** la dirección de la ISS, limitada a 78° del punto subsolar. Mientras la ISS está de día el observador la sigue; cuando entra en la noche, espera junto al terminador, donde siguen viéndose las nubes reales.
 2. **Desfase:** de 9° a 19° por detrás de la ISS a lo largo de su órbita, y hasta ±16° fuera del plano orbital.
 3. **Altitud:** 3600 ± 1600 km, en un ciclo de 25 min.
 4. **Mirada:** apunta a la ISS, o al terminador en su dirección cuando la ISS está en plena noche, y sube o baja la inclinación hasta que la Tierra cubre la fracción objetivo de la pantalla (entre 40 % y 60 %, con un ciclo de 30 min). La ISS no sale del encuadre.
 5. **Orientación:** el "arriba" de la cámara es la vertical local, así que el horizonte aparece nivelado.
+
+### Cielo
+
+Las estrellas son puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico. La Vía Láctea es solo un brillo uniforme muy tenue, sin texturas de ruido, que se veían como manchas grises.
 
 ## 6. Pipeline DXR
 
@@ -95,6 +100,9 @@ CoverageMin=0.40
 CoverageMax=0.60
 Offline=0
 TimeOffsetHours=0    ; ver la Tierra a otra hora
+FocusLat=23.6        ; punto inicial de interés (México)
+FocusLon=-102.5
+FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.

@@ -18,7 +18,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 | R5 | Velocidad de los satélites real respecto al planeta dibujado | Todo se dibuja en **kilómetros**: Tierra de 6371 km y satélites a su altitud real. Las órbitas salen de los **TLE actuales de Celestrak** (ISS y Hubble), propagadas con Kepler + J2 en doble precisión y con el reloj UTC real. |
 | R6 | Distancia Sol–Tierra realista | Efemérides solares (Almanaque Astronómico): distancia de **0.983–1.017 UA (≈ 23 000 radios terrestres)** según la fecha, con el tamaño angular real (0.53°). |
 | R7 | La pantalla muestra el 40–60 % del planeta | La cámara busca cada frame la inclinación con la que el disco terrestre cubre la fracción objetivo de la pantalla (cuadrícula de 48×27 rayos y búsqueda binaria). El objetivo oscila entre `CoverageMin` y `CoverageMax` con el movimiento del observador. |
-| R8 | Rotación terrestre y cámara cinemática | La Tierra gira según el GMST real, así que el lado iluminado coincide con el de este momento. El observador sigue la órbita de la ISS desde más alto (entre 2000 y 5200 km de altitud), con desfase y desplazamiento lateral variables. |
+| R8 | Rotación terrestre y cámara cinemática | La Tierra gira según el GMST real, así que el lado iluminado coincide con el de este momento. El observador empieza estacionado sobre **México** (configurable), girando con la Tierra, y tras `FocusMinutes` pasa suavemente a seguir la órbita de la ISS desde más alto (entre 2000 y 5200 km de altitud). |
 
 ## 2. Escala física (verificada)
 
@@ -61,11 +61,16 @@ Sin conexión (o con `Offline=1`) usa la caché. Si tampoco hay caché, dibuja u
 
 ## 5. Cámara (observador)
 
-1. **Punto base:** la dirección de la ISS, limitada a 78° del punto subsolar. Mientras la ISS está de día el observador la sigue; cuando entra en la noche, espera junto al terminador, donde siguen viéndose las nubes reales.
+0. **Inicio sobre México:** durante los primeros `FocusMinutes` (20 por defecto) el observador está entre 9° y 15° al sur de `FocusLat`/`FocusLon` (23.6° N, 102.5° O), con un vaivén lateral de ±30°, y mira hacia el norte con el horizonte al fondo. Gira con la Tierra, así que México no sale de la vista: se ve de día con las nubes reales y de noche con las luces de sus ciudades. Después pasa en 3 minutos al modo de seguimiento. Con `FocusMinutes=-1` se queda siempre sobre ese punto.
+1. **Punto base (seguimiento):** la dirección de la ISS, limitada a 78° del punto subsolar. Mientras la ISS está de día el observador la sigue; cuando entra en la noche, espera junto al terminador, donde siguen viéndose las nubes reales.
 2. **Desfase:** de 9° a 19° por detrás de la ISS a lo largo de su órbita, y hasta ±16° fuera del plano orbital.
 3. **Altitud:** 3600 ± 1600 km, en un ciclo de 25 min.
 4. **Mirada:** apunta a la ISS, o al terminador en su dirección cuando la ISS está en plena noche, y sube o baja la inclinación hasta que la Tierra cubre la fracción objetivo de la pantalla (entre 40 % y 60 %, con un ciclo de 30 min). La ISS no sale del encuadre.
 5. **Orientación:** el "arriba" de la cámara es la vertical local, así que el horizonte aparece nivelado.
+
+### Cielo
+
+Las estrellas son puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico. La Vía Láctea es solo un brillo uniforme muy tenue, sin texturas de ruido, que se veían como manchas grises.
 
 ## 6. Pipeline DXR
 
@@ -95,6 +100,9 @@ CoverageMin=0.40
 CoverageMax=0.60
 Offline=0
 TimeOffsetHours=0    ; ver la Tierra a otra hora
+FocusLat=23.6        ; punto inicial de interés (México)
+FocusLon=-102.5
+FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.
@@ -106,7 +114,7 @@ Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas 
 ### 8.1 Shaders HLSL (`src/shaders/Space.hlsl`)
 
 ```hlsl
-// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
+﻿// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
 //   - Earth (R = 6371 km): NASA Blue Marble day map, Black Marble night lights, live cloud map
 //     with cloud shadows, ocean sun glint, physically based single-scattering atmosphere
 //     (Rayleigh + Mie, 100 km thick, Chapman approximation for sunlight transmittance)
@@ -235,7 +243,7 @@ float2 LatLonUV(float3 ecef)
 // ---------------------------------------------------------------------------
 // Atmosphere (single scattering)
 // ---------------------------------------------------------------------------
-// Chapman function approximation (C. Schüler): relative air mass along a ray towards zenith
+// Chapman function approximation (C. SchÃ¼ler): relative air mass along a ray towards zenith
 // angle chi, starting at normalised height h, for a planet of normalised radius X.
 float Chapman(float X, float h, float cosChi)
 {
@@ -313,27 +321,36 @@ float3 Atmosphere(float3 o, float3 d, float tMax, out float3 transmittance)
 // ---------------------------------------------------------------------------
 // Background: stars and the Sun (real angular size)
 // ---------------------------------------------------------------------------
+// Point-like stars sized to the pixel (no shimmer), with a steep magnitude distribution:
+// many faint stars, a few bright ones, denser along the Milky Way band.
 float3 Stars(float3 d)
 {
+    float pixelAngle = 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
+    float sigma = max(pixelAngle * 0.6f, 1e-5f);
+    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 30.0f);   // galactic plane
     float3 col = 0;
-    const float scales[2] = { 220.0f, 520.0f };
+    const float scales[3] = { 90.0f, 200.0f, 420.0f };
+    const float density[3] = { 0.02f, 0.035f, 0.05f };
+    const float gain[3] = { 50.0f, 18.0f, 6.0f };
     [unroll]
-    for (int l = 0; l < 2; l++)
+    for (int l = 0; l < 3; l++)
     {
         float3 p = d * scales[l];
         float3 cell = floor(p);
-        float3 f = frac(p) - 0.5f;
         float h = Hash31(cell);
-        if (h > 0.975f)
+        float thr = 1.0f - density[l] * (1.0f + 2.5f * band);
+        if (h > thr)
         {
-            float3 off = (float3(Hash31(cell + 1.3f), Hash31(cell + 2.7f), Hash31(cell + 4.1f)) - 0.5f) * 0.6f;
-            float b = smoothstep(0.16f, 0.0f, length(f - off)) * (h - 0.975f) / 0.025f;
-            float3 tint = lerp(float3(0.65f, 0.75f, 1.0f), float3(1.0f, 0.85f, 0.65f), Hash31(cell + 9.0f));
-            col += tint * b * b * (l == 0 ? 2.5f : 1.0f);
+            float3 off = float3(Hash31(cell + 1.3f), Hash31(cell + 2.7f), Hash31(cell + 4.1f)) * 0.8f + 0.1f;
+            float3 star = normalize((cell + off) / scales[l]);
+            float a = acos(clamp(dot(d, star), -1.0f, 1.0f));
+            float mag = pow(Hash31(cell + 5.9f), 6.0f);                      // steep: few bright stars
+            float b = exp(-(a * a) / (sigma * sigma)) * mag * gain[l];
+            float3 tint = lerp(float3(0.7f, 0.8f, 1.0f), float3(1.0f, 0.88f, 0.7f), Hash31(cell + 9.0f));
+            col += tint * b;
         }
     }
-    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 45.0f);
-    col += float3(0.05f, 0.045f, 0.07f) * band * smoothstep(0.55f, 0.85f, Fbm3(d * 14.0f, 4)) * 0.12f;
+    col += float3(0.010f, 0.010f, 0.016f) * band;   // faint, smooth unresolved glow (no noise blotches)
     return col;
 }
 
@@ -730,8 +747,10 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
 //      t1 day   - NASA Blue Marble Next Generation (GIBS), RGB + ocean mask in alpha
 //      t2 night - NASA Black Marble (VIIRS) city lights
 //      t3 clouds- live global cloud map, re-checked every hour (ETag, only re-downloaded if changed)
-//  - Camera: rides behind and above the ISS while it is in daylight; when the ISS crosses to the
-//    night side the observer waits near the terminator. It pitches so the Earth covers 40-60 %.
+//  - Camera: starts parked over a chosen place (default Mexico), turning with the Earth; after
+//    FocusMinutes it glides over to ride behind and above the ISS while it is in daylight (when the
+//    ISS crosses to the night side the observer waits near the terminator). It always pitches so the
+//    Earth covers 40-60 % of the screen.
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -755,6 +774,9 @@ public:
         float coverageMin = 0.40f;     // fraction of the screen covered by the Earth
         float coverageMax = 0.60f;
         bool offline = false;          // never download (use cache / procedural fallback)
+        double focusLat = 23.6;        // initial point of interest (default: Mexico)
+        double focusLon = -102.5;
+        double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -927,12 +949,32 @@ public:
             ground = RotateTowards(sunDir, r, DAY_LIMIT);
         Vec3 camDir = (ground * std::cos(lag) - along * std::sin(lag)).Normalized();
         camDir = (camDir * std::cos(side) + n * std::sin(side)).Normalized();
-        const Vec3 cam = camDir * (astro::EARTH_RADIUS + altitude);
 
         // Look at the ISS; once it is deep in the night, look at the terminator in its direction instead.
         const double w = SmoothStep(DAY_LIMIT + 5 * astro::DEG, DAY_LIMIT + 30 * astro::DEG, issFromSun);
         const Vec3 dusk = RotateTowards(sunDir, r, DAY_LIMIT + 20 * astro::DEG) * astro::EARTH_RADIUS;
-        const Vec3 lookAt = p * (1.0 - w) + dusk * w;
+        Vec3 lookAt = p * (1.0 - w) + dusk * w;
+
+        // Focus mode: hover south of the focus point (turning with the Earth) and look at it, with
+        // the horizon beyond. Blends into the ISS-following mode after focusMinutes.
+        const double focusWeight = m_settings.focusMinutes < 0 ? 1.0
+            : 1.0 - SmoothStep(m_settings.focusMinutes * 60.0, m_settings.focusMinutes * 60.0 + 180.0, tau);
+        if (focusWeight > 0.0)
+        {
+            const double lat = m_settings.focusLat * astro::DEG, lon = m_settings.focusLon * astro::DEG;
+            const Vec3 ecef = { std::cos(lat) * std::cos(lon), std::cos(lat) * std::sin(lon), std::sin(lat) };
+            // ECEF -> world is the transpose of the world -> ECEF rows sent to the shader.
+            const Vec3 focus = Vec3{ c, 0, -s } * ecef.x + Vec3{ -s, 0, -c } * ecef.y + Vec3{ 0, 1, 0 } * ecef.z;
+            Vec3 south = (Vec3{ 0, -1, 0 } - focus * -focus.y).Normalized();
+            Vec3 east = astro::Cross(south, focus).Normalized();
+            const double swing = 30.0 * osc(1500.0, 0.3) * astro::DEG;        // slow sideways drift
+            const Vec3 away = (south * std::cos(swing) + east * std::sin(swing)).Normalized();
+            const double back = (12.0 + 3.0 * osc(1900.0, 1.2)) * astro::DEG; // distance south of the target
+            const Vec3 focusCam = (focus * std::cos(back) + away * std::sin(back)).Normalized();
+            camDir = (camDir * (1.0 - focusWeight) + focusCam * focusWeight).Normalized();
+            lookAt = lookAt * (1.0 - focusWeight) + focus * (astro::EARTH_RADIUS * focusWeight);
+        }
+        const Vec3 cam = camDir * (astro::EARTH_RADIUS + altitude);
 
         const float target = m_settings.coverageMin + (m_settings.coverageMax - m_settings.coverageMin) *
                                                          (float)(0.5 + 0.5 * osc(1800.0, 0.5));
@@ -1020,6 +1062,12 @@ private:
         m_settings.offline = GetPrivateProfileIntW(sec, L"Offline", 0, ini.c_str()) != 0;
         GetPrivateProfileStringW(sec, L"TimeOffsetHours", L"0", buf, 64, ini.c_str());
         m_settings.timeOffsetHours = std::clamp(_wtof(buf), -8760.0, 8760.0);
+        GetPrivateProfileStringW(sec, L"FocusLat", L"23.6", buf, 64, ini.c_str());
+        m_settings.focusLat = std::clamp(_wtof(buf), -90.0, 90.0);
+        GetPrivateProfileStringW(sec, L"FocusLon", L"-102.5", buf, 64, ini.c_str());
+        m_settings.focusLon = std::clamp(_wtof(buf), -180.0, 180.0);
+        GetPrivateProfileStringW(sec, L"FocusMinutes", L"20", buf, 64, ini.c_str());
+        m_settings.focusMinutes = _wtof(buf);
     }
 
     // -----------------------------------------------------------------------

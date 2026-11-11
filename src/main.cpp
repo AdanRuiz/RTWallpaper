@@ -113,7 +113,11 @@ static const char kDefaultIni[] =
     "; 1 = never download (use the cache or the procedural Earth)\r\n"
     "Offline=0\r\n"
     "; Show the Earth at another time, in hours from now (0 = live)\r\n"
-    "TimeOffsetHours=0\r\n";
+    "TimeOffsetHours=0\r\n"
+    "; Initial point of interest (default Mexico) and minutes over it before following the ISS (-1 = always)\r\n"
+    "FocusLat=23.6\r\n"
+    "FocusLon=-102.5\r\n"
+    "FocusMinutes=20\r\n";
 
 static std::wstring ConfigPath()
 {

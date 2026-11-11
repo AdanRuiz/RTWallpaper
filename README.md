@@ -6,7 +6,7 @@ Incluye varias escenas que se eligen en un archivo de configuración.
 | Escena | Diseño | Qué hay |
 |---|---|---|
 | `marble` | [`ray_tracing_windows_desktop_wallpaper.md`](ray_tracing_windows_desktop_wallpaper.md) | Piso de mármol negro con reflexión Fresnel y sombras; 3 esferas de cuarzo exactas con refracción de Snell, reflexión interna total y absorción de Beer; 2 luces de neón; movimiento con OpenSimplex2 ([FastNoiseLite](https://github.com/Auburn/FastNoiseLite)). |
-| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km):** mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara sigue a la ISS y mantiene la Tierra en el 40–60 % de la pantalla. |
+| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km):** mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara empieza mirando hacia México y luego sigue a la ISS; siempre mantiene la Tierra en el 40–60 % de la pantalla. |
 
 La escena `space` descarga sus datos la primera vez (~30 MB, unos 45 s) en `%LOCALAPPDATA%\RTWallpaper\cache` y después funciona también sin conexión. Los detalles están en [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md).
 
@@ -49,6 +49,9 @@ CoverageMin=0.40          ; fracción de la pantalla que ocupa la Tierra
 CoverageMax=0.60
 Offline=0
 TimeOffsetHours=0         ; ver la Tierra a otra hora
+FocusLat=23.6             ; punto inicial que mira la cámara (México)
+FocusLon=-102.5
+FocusMinutes=20           ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 ```
 
 También puedes cambiar de escena desde el icono de la bandeja (modo fondo) o con **Tab** (modo ventana).

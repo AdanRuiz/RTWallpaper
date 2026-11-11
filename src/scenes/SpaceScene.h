@@ -9,8 +9,10 @@
 //      t1 day   - NASA Blue Marble Next Generation (GIBS), RGB + ocean mask in alpha
 //      t2 night - NASA Black Marble (VIIRS) city lights
 //      t3 clouds- live global cloud map, re-checked every hour (ETag, only re-downloaded if changed)
-//  - Camera: rides behind and above the ISS while it is in daylight; when the ISS crosses to the
-//    night side the observer waits near the terminator. It pitches so the Earth covers 40-60 %.
+//  - Camera: starts parked over a chosen place (default Mexico), turning with the Earth; after
+//    FocusMinutes it glides over to ride behind and above the ISS while it is in daylight (when the
+//    ISS crosses to the night side the observer waits near the terminator). It always pitches so the
+//    Earth covers 40-60 % of the screen.
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -34,6 +36,9 @@ public:
         float coverageMin = 0.40f;     // fraction of the screen covered by the Earth
         float coverageMax = 0.60f;
         bool offline = false;          // never download (use cache / procedural fallback)
+        double focusLat = 23.6;        // initial point of interest (default: Mexico)
+        double focusLon = -102.5;
+        double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -206,12 +211,32 @@ public:
             ground = RotateTowards(sunDir, r, DAY_LIMIT);
         Vec3 camDir = (ground * std::cos(lag) - along * std::sin(lag)).Normalized();
         camDir = (camDir * std::cos(side) + n * std::sin(side)).Normalized();
-        const Vec3 cam = camDir * (astro::EARTH_RADIUS + altitude);
 
         // Look at the ISS; once it is deep in the night, look at the terminator in its direction instead.
         const double w = SmoothStep(DAY_LIMIT + 5 * astro::DEG, DAY_LIMIT + 30 * astro::DEG, issFromSun);
         const Vec3 dusk = RotateTowards(sunDir, r, DAY_LIMIT + 20 * astro::DEG) * astro::EARTH_RADIUS;
-        const Vec3 lookAt = p * (1.0 - w) + dusk * w;
+        Vec3 lookAt = p * (1.0 - w) + dusk * w;
+
+        // Focus mode: hover south of the focus point (turning with the Earth) and look at it, with
+        // the horizon beyond. Blends into the ISS-following mode after focusMinutes.
+        const double focusWeight = m_settings.focusMinutes < 0 ? 1.0
+            : 1.0 - SmoothStep(m_settings.focusMinutes * 60.0, m_settings.focusMinutes * 60.0 + 180.0, tau);
+        if (focusWeight > 0.0)
+        {
+            const double lat = m_settings.focusLat * astro::DEG, lon = m_settings.focusLon * astro::DEG;
+            const Vec3 ecef = { std::cos(lat) * std::cos(lon), std::cos(lat) * std::sin(lon), std::sin(lat) };
+            // ECEF -> world is the transpose of the world -> ECEF rows sent to the shader.
+            const Vec3 focus = Vec3{ c, 0, -s } * ecef.x + Vec3{ -s, 0, -c } * ecef.y + Vec3{ 0, 1, 0 } * ecef.z;
+            Vec3 south = (Vec3{ 0, -1, 0 } - focus * -focus.y).Normalized();
+            Vec3 east = astro::Cross(south, focus).Normalized();
+            const double swing = 30.0 * osc(1500.0, 0.3) * astro::DEG;        // slow sideways drift
+            const Vec3 away = (south * std::cos(swing) + east * std::sin(swing)).Normalized();
+            const double back = (12.0 + 3.0 * osc(1900.0, 1.2)) * astro::DEG; // distance south of the target
+            const Vec3 focusCam = (focus * std::cos(back) + away * std::sin(back)).Normalized();
+            camDir = (camDir * (1.0 - focusWeight) + focusCam * focusWeight).Normalized();
+            lookAt = lookAt * (1.0 - focusWeight) + focus * (astro::EARTH_RADIUS * focusWeight);
+        }
+        const Vec3 cam = camDir * (astro::EARTH_RADIUS + altitude);
 
         const float target = m_settings.coverageMin + (m_settings.coverageMax - m_settings.coverageMin) *
                                                          (float)(0.5 + 0.5 * osc(1800.0, 0.5));
@@ -299,6 +324,12 @@ private:
         m_settings.offline = GetPrivateProfileIntW(sec, L"Offline", 0, ini.c_str()) != 0;
         GetPrivateProfileStringW(sec, L"TimeOffsetHours", L"0", buf, 64, ini.c_str());
         m_settings.timeOffsetHours = std::clamp(_wtof(buf), -8760.0, 8760.0);
+        GetPrivateProfileStringW(sec, L"FocusLat", L"23.6", buf, 64, ini.c_str());
+        m_settings.focusLat = std::clamp(_wtof(buf), -90.0, 90.0);
+        GetPrivateProfileStringW(sec, L"FocusLon", L"-102.5", buf, 64, ini.c_str());
+        m_settings.focusLon = std::clamp(_wtof(buf), -180.0, 180.0);
+        GetPrivateProfileStringW(sec, L"FocusMinutes", L"20", buf, 64, ini.c_str());
+        m_settings.focusMinutes = _wtof(buf);
     }
 
     // -----------------------------------------------------------------------
