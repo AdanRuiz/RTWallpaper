@@ -257,11 +257,3 @@ if __name__ == "__main__":
 1. **Temporal Reprojection (TAA):** Sample only **16 steps** per pixel per frame, but jitter the step offset per frame using a 2D Blue Noise texture. Blend results across frames to achieve crisp 128-step quality with zero performance overhead.
 2. **Half-Resolution Rendering:** Render the volumetric cloud pass to an offscreen buffer at $50\%$ screen resolution, then upscale and composite onto the high-res earth surface using depth-aware bilinear filtering.
 3. **Bounding Shell Intersection:** Never raymarch empty space! Intersect ray rays against bounding spheres $R_{\text{bottom}}$ and $R_{\text{top}}$ to strictly evaluate steps within the active atmosphere layer.
-```
-
-He generado el archivo `2D_TO_3D_VOLUMETRIC_CLOUDS.md` en la barra lateral. 
-
-### ¿Qué incluye este documento?
-1. **Modelado Físico:** Cómo deducir la altitud y tope de la nube a partir de la temperatura infrarroja del satélite GOES (Banda 13) e integrarla con la reflectancia visible (Banda 2).
-2. **Shader Completo de Raymarching (GLSL/HLSL):** El algoritmo optimizado para interceptar la esfera del planeta, calcular la densidad 3D mezclada con ruido Perlin-Worley y resolver la dispersión de luz (**Beer-Lambert + Henyey-Greenstein**).
-3. **Pipeline en Python:** Script listo para tomar imágenes satelitales 2D de fuentes públicas y empaquetarlas en un *Weather Map RGBA* comprensible por cualquier motor de render 3D (Unreal, Unity, Three.js o Godot).
