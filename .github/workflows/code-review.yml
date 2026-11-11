@@ -1,0 +1,17 @@
+name: Code review
+on: [workflow_dispatch, pull_request]
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: AdanRuiz/advanced-code-review@feature/github-action
+        with:
+          event-start: 2026-10-24T16:30:00-06:00   # opcional
+          event-end: 2026-11-05T23:59:00-06:00     # opcional
+          ai-review: true
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
