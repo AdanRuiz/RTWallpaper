@@ -3,10 +3,20 @@
 Fondos de escritorio animados para Windows que usan **DirectX Raytracing (DXR 1.0)** nativo en la GPU, en tiempo real.
 Incluye varias escenas que se eligen en un archivo de configuración.
 
+## Capturas
+
+Escena `space` como fondo de escritorio en una configuración de dos monitores (una sola escena repartida entre ambos):
+
+| Monitor 1 (principal, 2560×1440) | Monitor 2 (1920×1080) |
+|---|---|
+| ![Monitor 1: la Tierra sobre México con las nubes reales de ese momento](docs/screenshots/monitor1.jpg) | ![Monitor 2: el Caribe y la Vía Láctea con nebulosas violetas, regiones H-alfa rojas y grietas de polvo](docs/screenshots/monitor2.jpg) |
+
+> Capturadas el 11 de noviembre de 2026 a las 11:00 (hora de México): texturas de la NASA y las nubes reales de ese momento.
+
 | Escena | Diseño | Qué hay |
 |---|---|---|
 | `marble` | [`ray_tracing_windows_desktop_wallpaper.md`](ray_tracing_windows_desktop_wallpaper.md) | Piso de mármol negro con reflexión Fresnel y sombras; 3 esferas de cuarzo exactas con refracción de Snell, reflexión interna total y absorción de Beer; 2 luces de neón; movimiento con OpenSimplex2 ([FastNoiseLite](https://github.com/Auburn/FastNoiseLite)). |
-| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km):** mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara empieza mirando hacia México y luego sigue a la ISS; siempre mantiene la Tierra en el 40–60 % de la pantalla. |
+| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km)**, con la Vía Láctea al fondo (nubes estelares violetas, nebulosas H-alfa rojas y grietas de polvo oscuro): mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara empieza mirando hacia México y luego sigue a la ISS; siempre mantiene la Tierra en el 40–60 % de la pantalla. |
 
 La escena `space` descarga sus datos la primera vez (~30 MB, unos 45 s) en `%LOCALAPPDATA%\RTWallpaper\cache` y después funciona también sin conexión. Los detalles están en [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md).
 
@@ -52,6 +62,7 @@ TimeOffsetHours=0         ; ver la Tierra a otra hora
 FocusLat=23.6             ; punto inicial que mira la cámara (México)
 FocusLon=-102.5
 FocusMinutes=20           ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
+Galaxy=scenic             ; scenic (Vía Láctea siempre a la vista) | real (orientación astronómica)
 ```
 
 También puedes cambiar de escena desde el icono de la bandeja (modo fondo) o con **Tab** (modo ventana).
@@ -98,3 +109,9 @@ build.ps1                punto de entrada en Windows
 1. Crea `src/shaders/MiEscena.hlsl` exportando `RayGen`, `Miss`, `ShadowMiss` y tus hit groups (root signature: `u0` salida, `t0` TLAS, `b0` constantes).
 2. Crea `src/scenes/MiEscenaScene.h` que herede de `Scene` e incluya `MiEscena.hlsl.h` (`g_pMiEscena`).
 3. Regístrala en `kSceneNames` / `CreateScene` en `src/main.cpp`.
+
+## Créditos
+
+El código de este proyecto lo generó **Claude** (Anthropic), y **Adán Ruiz** lo revisó y lo fue iterando.
+
+Datos y bibliotecas de terceros: texturas de la Tierra de NASA GIBS (Blue Marble, Black Marble), mapa de nubes en vivo de [clouds.matteason.co.uk](https://clouds.matteason.co.uk), elementos orbitales de [Celestrak](https://celestrak.org) y [FastNoiseLite](https://github.com/Auburn/FastNoiseLite) (MIT).

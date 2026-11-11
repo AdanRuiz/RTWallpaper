@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Scene "space" (space_rtx_wallpaper.md): the real Earth, right now, at real scale.
 //
 //  - Units: kilometres. Earth radius 6371 km, satellites at their real altitudes.
@@ -39,6 +39,7 @@ public:
         double focusLat = 23.6;        // initial point of interest (default: Mexico)
         double focusLon = -102.5;
         double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
+        bool galaxyReal = false;       // true: real galactic orientation; false: "scenic", band kept in view
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -52,6 +53,8 @@ private:
         DirectX::XMFLOAT4 earthRow[3];    // world -> ECEF rotation (rows)
         DirectX::XMFLOAT4 params;         // x = scene time (s), y = has day map, z = has night map, w = has clouds
         DirectX::XMFLOAT4 textureInfo;    // x = day width, y = night width, z = cloud width
+        DirectX::XMFLOAT4 galaxyCenter;   // world direction of the galactic centre
+        DirectX::XMFLOAT4 galaxyPole;     // world direction of the galactic north pole
     };
 
     struct Shared
@@ -72,6 +75,7 @@ private:
     float m_hasTexture[3] = {};
     float m_textureWidth[3] = {};
     float m_lastPitch = 0.0f;
+    astro::Vec3 m_galaxyCenter{}, m_galaxyPole{};   // smoothed scenic galaxy frame
 
 public:
     explicit SpaceScene(const std::wstring& iniPath)
@@ -260,6 +264,7 @@ public:
                                   XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
                                   XMVectorSet((float)camDir.x, (float)camDir.y, (float)camDir.z, 0));
 
+        UpdateGalaxyFrame(fwd, camDir, cb);
         cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
         cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
         return sizeof(Constants);
@@ -267,6 +272,38 @@ public:
 
 private:
     static constexpr double DAY_LIMIT = 78.0 * astro::DEG;   // max observer distance from the subsolar point
+
+    // Galactic frame for the sky. Real: galactic north pole RA 192.86 Dec +27.13, centre RA 266.40
+    // Dec -28.94 (converted to world = (eci.x, eci.z, -eci.y)). Scenic: the band crosses the upper
+    // part of the screen diagonally with the bright centre to the upper right; the frame follows the
+    // camera slowly, so the sky still drifts gently.
+    void UpdateGalaxyFrame(const astro::Vec3& fwd, const astro::Vec3& upHint, Constants& cb)
+    {
+        using astro::Vec3;
+        Vec3 center, pole;
+        if (m_settings.galaxyReal)
+        {
+            center = { -0.05487, -0.48388, 0.87342 };
+            pole = { -0.86776, 0.45599, 0.19762 };
+        }
+        else
+        {
+            const Vec3 right = astro::Cross(fwd, upHint).Normalized();
+            const Vec3 up = astro::Cross(right, fwd);
+            Vec3 c = (fwd * 0.92 + up * 0.30 + right * 0.32).Normalized();   // ~18 deg up, ~19 deg right: inside the frame
+            Vec3 across = (right * std::cos(28 * astro::DEG) - up * std::sin(28 * astro::DEG));
+            Vec3 p = astro::Cross(c, across).Normalized();
+            if (m_galaxyPole.Length() < 0.5) { m_galaxyCenter = c; m_galaxyPole = p; }
+            const double k = 0.01;   // low-pass: ignore frame-to-frame camera jitter
+            m_galaxyCenter = (m_galaxyCenter * (1 - k) + c * k).Normalized();
+            m_galaxyPole = (m_galaxyPole * (1 - k) + p * k);
+            m_galaxyPole = (m_galaxyPole - m_galaxyCenter * astro::Dot(m_galaxyPole, m_galaxyCenter)).Normalized();
+            center = m_galaxyCenter;
+            pole = m_galaxyPole;
+        }
+        cb.galaxyCenter = DirectX::XMFLOAT4((float)center.x, (float)center.y, (float)center.z, 0);
+        cb.galaxyPole = DirectX::XMFLOAT4((float)pole.x, (float)pole.y, (float)pole.z, 0);
+    }
 
     static double SmoothStep(double a, double b, double x)
     {
@@ -330,6 +367,8 @@ private:
         m_settings.focusLon = std::clamp(_wtof(buf), -180.0, 180.0);
         GetPrivateProfileStringW(sec, L"FocusMinutes", L"20", buf, 64, ini.c_str());
         m_settings.focusMinutes = _wtof(buf);
+        GetPrivateProfileStringW(sec, L"Galaxy", L"scenic", buf, 64, ini.c_str());
+        m_settings.galaxyReal = _wcsicmp(buf, L"real") == 0;
     }
 
     // -----------------------------------------------------------------------

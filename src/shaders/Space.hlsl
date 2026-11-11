@@ -1,4 +1,4 @@
-﻿// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
+// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
 //   - Earth (R = 6371 km): NASA Blue Marble day map, Black Marble night lights, live cloud map
 //     with cloud shadows, ocean sun glint, physically based single-scattering atmosphere
 //     (Rayleigh + Mie, 100 km thick, Chapman approximation for sunlight transmittance)
@@ -31,6 +31,8 @@ struct SceneConstantBuffer
     float4 earthRow[3];      // world -> Earth-fixed (ECEF) rotation rows
     float4 params;           // x = scene time (s), y = has day map, z = has night map, w = has clouds
     float4 textureInfo;      // x = day width, y = night width, z = cloud width
+    float4 galaxyCenter;     // world direction of the galactic centre
+    float4 galaxyPole;       // world direction of the galactic north pole
 };
 
 struct RayPayload
@@ -211,7 +213,7 @@ float3 Stars(float3 d)
 {
     float pixelAngle = 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
     float sigma = max(pixelAngle * 0.6f, 1e-5f);
-    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 30.0f);   // galactic plane
+    float band = exp(-d.y * d.y * 30.0f);   // denser along the galactic plane (d in galactic coords)
     float3 col = 0;
     const float scales[3] = { 90.0f, 200.0f, 420.0f };
     const float density[3] = { 0.02f, 0.035f, 0.05f };
@@ -234,8 +236,60 @@ float3 Stars(float3 d)
             col += tint * b;
         }
     }
-    col += float3(0.010f, 0.010f, 0.016f) * band;   // faint, smooth unresolved glow (no noise blotches)
     return col;
+}
+
+// Ridged noise: thin bright filaments (gas filaments, dust lanes).
+float Ridge(float3 p, int octaves)
+{
+    float s = 0.0f, a = 0.5f, norm = 0.0f;
+    for (int i = 0; i < octaves; i++)
+    {
+        float v = 1.0f - abs(Noise3(p) * 2.0f - 1.0f);
+        s += a * v * v;
+        norm += a;
+        p = p * 2.03f + float3(5.3f, 1.9f, 7.7f);
+        a *= 0.5f;
+    }
+    return s / norm;
+}
+
+// Milky Way, as in long-exposure photos: violet star clouds with light tones towards the
+// galactic centre, red H-alpha emission nebulae, and dark dust rifts along the plane.
+// Everything is anchored to the galactic plane and domain-warped so it reads as gas, not blobs.
+// Returns the emitted light; `dust` (0..1) is the absorption, also applied to the stars behind.
+// d is in galactic coordinates: x = towards the centre, y = galactic north pole.
+float3 MilkyWay(float3 d, out float dust)
+{
+    float sb = d.y;                                               // sin(galactic latitude)
+    float l = atan2(d.z, d.x);                                    // galactic longitude
+    float core = exp(-l * l / 0.45f);                             // bulge around the centre
+
+    float3 q = d * 6.0f;
+    float3 warp = float3(Fbm3(q + 1.7f, 3), Fbm3(q + 9.2f, 3), Fbm3(q + 4.4f, 3)) - 0.5f;
+    float3 w = q + warp * 0.55f;
+    float bw = sb + (Fbm3(d * 4.0f + 2.3f, 3) - 0.5f) * 0.08f;   // wavy band edges
+    float width = 0.045f + 0.06f * core;
+    float band = exp(-bw * bw / (width * width));
+
+    // Star clouds: violet, turning pinkish-white where dense and near the core.
+    float clouds = Fbm3(w * 3.2f, 5);
+    float grain = 0.55f + 0.9f * Noise3(d * 900.0f) * Noise3(d * 260.0f + 3.1f);   // unresolved star clouds
+    float glow = band * grain * (0.2f + 0.8f * smoothstep(0.35f, 0.75f, clouds)) * (0.35f + 1.65f * core);
+    float3 violet = float3(0.40f, 0.28f, 0.78f);
+    float3 light = float3(0.98f, 0.86f, 0.95f);
+    float3 col = lerp(violet, light, smoothstep(0.55f, 0.85f, clouds) * (0.25f + 0.75f * core)) * glow;
+
+    // H-alpha emission nebulae: red/magenta filaments close to the plane, only in some regions.
+    float ha = smoothstep(0.60f, 0.85f, Ridge(w * 4.5f + 5.0f, 4)) * exp(-bw * bw / (0.07f * 0.07f));
+    float haRegion = smoothstep(0.52f, 0.72f, Fbm3(d * 3.0f + 7.7f, 3));
+    col += float3(0.95f, 0.12f, 0.20f) * ha * haRegion * 1.6f;
+
+    // Dark rifts: filamentary and broad dust lanes right on the plane (like the Great Rift).
+    float lanes = smoothstep(0.55f, 0.90f, Ridge(w * 3.6f + 11.0f, 5)) * exp(-sb * sb / (0.035f * 0.035f));
+    float broad = smoothstep(0.45f, 0.70f, Fbm3(w * 1.2f + 3.0f, 4)) * exp(-sb * sb / (0.035f * 0.035f));
+    dust = saturate(lanes * 0.9f + broad * 0.65f);
+    return col * (1.0f - dust) * 1.5f;
 }
 
 float3 Sun(float3 d)
@@ -253,9 +307,20 @@ float3 SunGlare(float3 d)
     return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.5f * exp(-a / (r * 40.0f)));
 }
 
+// World direction -> galactic coordinates. The frame comes from the constant buffer: either the
+// real astronomical orientation or a "scenic" one that keeps the band in view.
+float3 ToGalactic(float3 d)
+{
+    float3 x = g_cb.galaxyCenter.xyz, y = g_cb.galaxyPole.xyz;
+    return float3(dot(d, x), dot(d, y), dot(d, cross(y, x)));
+}
+
 float3 Background(float3 d)
 {
-    return Stars(d) + Sun(d);
+    float3 g = ToGalactic(d);
+    float dust;
+    float3 galaxy = MilkyWay(g, dust);
+    return Stars(g) * (1.0f - 0.85f * dust) + galaxy + Sun(d);
 }
 
 // ---------------------------------------------------------------------------

@@ -117,7 +117,9 @@ static const char kDefaultIni[] =
     "; Initial point of interest (default Mexico) and minutes over it before following the ISS (-1 = always)\r\n"
     "FocusLat=23.6\r\n"
     "FocusLon=-102.5\r\n"
-    "FocusMinutes=20\r\n";
+    "FocusMinutes=20\r\n"
+    "; Milky Way orientation: scenic (always in view) | real (astronomical)\r\n"
+    "Galaxy=scenic\r\n";
 
 static std::wstring ConfigPath()
 {

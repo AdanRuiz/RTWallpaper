@@ -4,6 +4,8 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 
 > Escena `space` de RTWallpaper. Se activa con `Scene=space` en `RTWallpaper.ini`.
 > Las secciones de código (§8) se generan desde el código fuente real con `python scripts/gen_space_doc.py`.
+>
+> El código lo generó Claude (Anthropic), y Adán Ruiz lo revisó y lo fue iterando.
 
 ---
 
@@ -70,7 +72,14 @@ Sin conexión (o con `Offline=1`) usa la caché. Si tampoco hay caché, dibuja u
 
 ### Cielo
 
-Las estrellas son puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico. La Vía Láctea es solo un brillo uniforme muy tenue, sin texturas de ruido, que se veían como manchas grises.
+* **Estrellas:** puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico.
+* **Vía Láctea**, como en las fotos de larga exposición, construida en coordenadas galácticas:
+  * **nubes estelares violetas** que se vuelven rosadas y blanquecinas hacia el núcleo, con un grano fino de estrellas sin resolver;
+  * **nebulosas de emisión H-alfa** rojas y magenta: filamentos de ruido *ridged*, solo en algunas regiones y pegadas al plano;
+  * **grietas de polvo oscuro**, filamentosas y anchas como la *Gran Grieta*, que absorben la luz de la galaxia y también la de las estrellas de detrás.
+* **Orientación** (`Galaxy=`):
+  * `scenic` (por defecto): la banda cruza en diagonal la parte superior de la pantalla, con el núcleo arriba a la derecha. Sigue a la cámara con un filtro lento.
+  * `real`: polo norte galáctico en AR 192.86°, Dec +27.13°, y centro galáctico en AR 266.40°, Dec −28.94° (Sagitario). Al girar con la Tierra, a veces queda fuera de cuadro.
 
 ## 6. Pipeline DXR
 
@@ -103,6 +112,7 @@ TimeOffsetHours=0    ; ver la Tierra a otra hora
 FocusLat=23.6        ; punto inicial de interés (México)
 FocusLon=-102.5
 FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
+Galaxy=scenic        ; scenic | real
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.

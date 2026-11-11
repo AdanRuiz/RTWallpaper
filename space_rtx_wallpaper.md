@@ -4,6 +4,8 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 
 > Escena `space` de RTWallpaper. Se activa con `Scene=space` en `RTWallpaper.ini`.
 > Las secciones de código (§8) se generan desde el código fuente real con `python scripts/gen_space_doc.py`.
+>
+> El código lo generó Claude (Anthropic), y Adán Ruiz lo revisó y lo fue iterando.
 
 ---
 
@@ -70,7 +72,14 @@ Sin conexión (o con `Offline=1`) usa la caché. Si tampoco hay caché, dibuja u
 
 ### Cielo
 
-Las estrellas son puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico. La Vía Láctea es solo un brillo uniforme muy tenue, sin texturas de ruido, que se veían como manchas grises.
+* **Estrellas:** puntos del tamaño de un píxel (gaussiana con σ = 0.6 píxeles, así no parpadean), en tres capas con una distribución de magnitudes muy inclinada: muchas tenues y pocas brillantes. Son más densas a lo largo del plano galáctico.
+* **Vía Láctea**, como en las fotos de larga exposición, construida en coordenadas galácticas:
+  * **nubes estelares violetas** que se vuelven rosadas y blanquecinas hacia el núcleo, con un grano fino de estrellas sin resolver;
+  * **nebulosas de emisión H-alfa** rojas y magenta: filamentos de ruido *ridged*, solo en algunas regiones y pegadas al plano;
+  * **grietas de polvo oscuro**, filamentosas y anchas como la *Gran Grieta*, que absorben la luz de la galaxia y también la de las estrellas de detrás.
+* **Orientación** (`Galaxy=`):
+  * `scenic` (por defecto): la banda cruza en diagonal la parte superior de la pantalla, con el núcleo arriba a la derecha. Sigue a la cámara con un filtro lento.
+  * `real`: polo norte galáctico en AR 192.86°, Dec +27.13°, y centro galáctico en AR 266.40°, Dec −28.94° (Sagitario). Al girar con la Tierra, a veces queda fuera de cuadro.
 
 ## 6. Pipeline DXR
 
@@ -103,6 +112,7 @@ TimeOffsetHours=0    ; ver la Tierra a otra hora
 FocusLat=23.6        ; punto inicial de interés (México)
 FocusLon=-102.5
 FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
+Galaxy=scenic        ; scenic | real
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.
@@ -114,7 +124,7 @@ Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas 
 ### 8.1 Shaders HLSL (`src/shaders/Space.hlsl`)
 
 ```hlsl
-﻿// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
+// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
 //   - Earth (R = 6371 km): NASA Blue Marble day map, Black Marble night lights, live cloud map
 //     with cloud shadows, ocean sun glint, physically based single-scattering atmosphere
 //     (Rayleigh + Mie, 100 km thick, Chapman approximation for sunlight transmittance)
@@ -147,6 +157,8 @@ struct SceneConstantBuffer
     float4 earthRow[3];      // world -> Earth-fixed (ECEF) rotation rows
     float4 params;           // x = scene time (s), y = has day map, z = has night map, w = has clouds
     float4 textureInfo;      // x = day width, y = night width, z = cloud width
+    float4 galaxyCenter;     // world direction of the galactic centre
+    float4 galaxyPole;       // world direction of the galactic north pole
 };
 
 struct RayPayload
@@ -327,7 +339,7 @@ float3 Stars(float3 d)
 {
     float pixelAngle = 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
     float sigma = max(pixelAngle * 0.6f, 1e-5f);
-    float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 30.0f);   // galactic plane
+    float band = exp(-d.y * d.y * 30.0f);   // denser along the galactic plane (d in galactic coords)
     float3 col = 0;
     const float scales[3] = { 90.0f, 200.0f, 420.0f };
     const float density[3] = { 0.02f, 0.035f, 0.05f };
@@ -350,8 +362,60 @@ float3 Stars(float3 d)
             col += tint * b;
         }
     }
-    col += float3(0.010f, 0.010f, 0.016f) * band;   // faint, smooth unresolved glow (no noise blotches)
     return col;
+}
+
+// Ridged noise: thin bright filaments (gas filaments, dust lanes).
+float Ridge(float3 p, int octaves)
+{
+    float s = 0.0f, a = 0.5f, norm = 0.0f;
+    for (int i = 0; i < octaves; i++)
+    {
+        float v = 1.0f - abs(Noise3(p) * 2.0f - 1.0f);
+        s += a * v * v;
+        norm += a;
+        p = p * 2.03f + float3(5.3f, 1.9f, 7.7f);
+        a *= 0.5f;
+    }
+    return s / norm;
+}
+
+// Milky Way, as in long-exposure photos: violet star clouds with light tones towards the
+// galactic centre, red H-alpha emission nebulae, and dark dust rifts along the plane.
+// Everything is anchored to the galactic plane and domain-warped so it reads as gas, not blobs.
+// Returns the emitted light; `dust` (0..1) is the absorption, also applied to the stars behind.
+// d is in galactic coordinates: x = towards the centre, y = galactic north pole.
+float3 MilkyWay(float3 d, out float dust)
+{
+    float sb = d.y;                                               // sin(galactic latitude)
+    float l = atan2(d.z, d.x);                                    // galactic longitude
+    float core = exp(-l * l / 0.45f);                             // bulge around the centre
+
+    float3 q = d * 6.0f;
+    float3 warp = float3(Fbm3(q + 1.7f, 3), Fbm3(q + 9.2f, 3), Fbm3(q + 4.4f, 3)) - 0.5f;
+    float3 w = q + warp * 0.55f;
+    float bw = sb + (Fbm3(d * 4.0f + 2.3f, 3) - 0.5f) * 0.08f;   // wavy band edges
+    float width = 0.045f + 0.06f * core;
+    float band = exp(-bw * bw / (width * width));
+
+    // Star clouds: violet, turning pinkish-white where dense and near the core.
+    float clouds = Fbm3(w * 3.2f, 5);
+    float grain = 0.55f + 0.9f * Noise3(d * 900.0f) * Noise3(d * 260.0f + 3.1f);   // unresolved star clouds
+    float glow = band * grain * (0.2f + 0.8f * smoothstep(0.35f, 0.75f, clouds)) * (0.35f + 1.65f * core);
+    float3 violet = float3(0.40f, 0.28f, 0.78f);
+    float3 light = float3(0.98f, 0.86f, 0.95f);
+    float3 col = lerp(violet, light, smoothstep(0.55f, 0.85f, clouds) * (0.25f + 0.75f * core)) * glow;
+
+    // H-alpha emission nebulae: red/magenta filaments close to the plane, only in some regions.
+    float ha = smoothstep(0.60f, 0.85f, Ridge(w * 4.5f + 5.0f, 4)) * exp(-bw * bw / (0.07f * 0.07f));
+    float haRegion = smoothstep(0.52f, 0.72f, Fbm3(d * 3.0f + 7.7f, 3));
+    col += float3(0.95f, 0.12f, 0.20f) * ha * haRegion * 1.6f;
+
+    // Dark rifts: filamentary and broad dust lanes right on the plane (like the Great Rift).
+    float lanes = smoothstep(0.55f, 0.90f, Ridge(w * 3.6f + 11.0f, 5)) * exp(-sb * sb / (0.035f * 0.035f));
+    float broad = smoothstep(0.45f, 0.70f, Fbm3(w * 1.2f + 3.0f, 4)) * exp(-sb * sb / (0.035f * 0.035f));
+    dust = saturate(lanes * 0.9f + broad * 0.65f);
+    return col * (1.0f - dust) * 1.5f;
 }
 
 float3 Sun(float3 d)
@@ -369,9 +433,20 @@ float3 SunGlare(float3 d)
     return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.5f * exp(-a / (r * 40.0f)));
 }
 
+// World direction -> galactic coordinates. The frame comes from the constant buffer: either the
+// real astronomical orientation or a "scenic" one that keeps the band in view.
+float3 ToGalactic(float3 d)
+{
+    float3 x = g_cb.galaxyCenter.xyz, y = g_cb.galaxyPole.xyz;
+    return float3(dot(d, x), dot(d, y), dot(d, cross(y, x)));
+}
+
 float3 Background(float3 d)
 {
-    return Stars(d) + Sun(d);
+    float3 g = ToGalactic(d);
+    float dust;
+    float3 galaxy = MilkyWay(g, dust);
+    return Stars(g) * (1.0f - 0.85f * dust) + galaxy + Sun(d);
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +811,7 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
 ### 8.2 Escena y cámara (C++) (`src/scenes/SpaceScene.h`)
 
 ```cpp
-﻿#pragma once
+#pragma once
 // Scene "space" (space_rtx_wallpaper.md): the real Earth, right now, at real scale.
 //
 //  - Units: kilometres. Earth radius 6371 km, satellites at their real altitudes.
@@ -777,6 +852,7 @@ public:
         double focusLat = 23.6;        // initial point of interest (default: Mexico)
         double focusLon = -102.5;
         double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
+        bool galaxyReal = false;       // true: real galactic orientation; false: "scenic", band kept in view
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -790,6 +866,8 @@ private:
         DirectX::XMFLOAT4 earthRow[3];    // world -> ECEF rotation (rows)
         DirectX::XMFLOAT4 params;         // x = scene time (s), y = has day map, z = has night map, w = has clouds
         DirectX::XMFLOAT4 textureInfo;    // x = day width, y = night width, z = cloud width
+        DirectX::XMFLOAT4 galaxyCenter;   // world direction of the galactic centre
+        DirectX::XMFLOAT4 galaxyPole;     // world direction of the galactic north pole
     };
 
     struct Shared
@@ -810,6 +888,7 @@ private:
     float m_hasTexture[3] = {};
     float m_textureWidth[3] = {};
     float m_lastPitch = 0.0f;
+    astro::Vec3 m_galaxyCenter{}, m_galaxyPole{};   // smoothed scenic galaxy frame
 
 public:
     explicit SpaceScene(const std::wstring& iniPath)
@@ -998,6 +1077,7 @@ public:
                                   XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
                                   XMVectorSet((float)camDir.x, (float)camDir.y, (float)camDir.z, 0));
 
+        UpdateGalaxyFrame(fwd, camDir, cb);
         cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
         cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
         return sizeof(Constants);
@@ -1005,6 +1085,38 @@ public:
 
 private:
     static constexpr double DAY_LIMIT = 78.0 * astro::DEG;   // max observer distance from the subsolar point
+
+    // Galactic frame for the sky. Real: galactic north pole RA 192.86 Dec +27.13, centre RA 266.40
+    // Dec -28.94 (converted to world = (eci.x, eci.z, -eci.y)). Scenic: the band crosses the upper
+    // part of the screen diagonally with the bright centre to the upper right; the frame follows the
+    // camera slowly, so the sky still drifts gently.
+    void UpdateGalaxyFrame(const astro::Vec3& fwd, const astro::Vec3& upHint, Constants& cb)
+    {
+        using astro::Vec3;
+        Vec3 center, pole;
+        if (m_settings.galaxyReal)
+        {
+            center = { -0.05487, -0.48388, 0.87342 };
+            pole = { -0.86776, 0.45599, 0.19762 };
+        }
+        else
+        {
+            const Vec3 right = astro::Cross(fwd, upHint).Normalized();
+            const Vec3 up = astro::Cross(right, fwd);
+            Vec3 c = (fwd * 0.92 + up * 0.30 + right * 0.32).Normalized();   // ~18 deg up, ~19 deg right: inside the frame
+            Vec3 across = (right * std::cos(28 * astro::DEG) - up * std::sin(28 * astro::DEG));
+            Vec3 p = astro::Cross(c, across).Normalized();
+            if (m_galaxyPole.Length() < 0.5) { m_galaxyCenter = c; m_galaxyPole = p; }
+            const double k = 0.01;   // low-pass: ignore frame-to-frame camera jitter
+            m_galaxyCenter = (m_galaxyCenter * (1 - k) + c * k).Normalized();
+            m_galaxyPole = (m_galaxyPole * (1 - k) + p * k);
+            m_galaxyPole = (m_galaxyPole - m_galaxyCenter * astro::Dot(m_galaxyPole, m_galaxyCenter)).Normalized();
+            center = m_galaxyCenter;
+            pole = m_galaxyPole;
+        }
+        cb.galaxyCenter = DirectX::XMFLOAT4((float)center.x, (float)center.y, (float)center.z, 0);
+        cb.galaxyPole = DirectX::XMFLOAT4((float)pole.x, (float)pole.y, (float)pole.z, 0);
+    }
 
     static double SmoothStep(double a, double b, double x)
     {
@@ -1068,6 +1180,8 @@ private:
         m_settings.focusLon = std::clamp(_wtof(buf), -180.0, 180.0);
         GetPrivateProfileStringW(sec, L"FocusMinutes", L"20", buf, 64, ini.c_str());
         m_settings.focusMinutes = _wtof(buf);
+        GetPrivateProfileStringW(sec, L"Galaxy", L"scenic", buf, 64, ini.c_str());
+        m_settings.galaxyReal = _wcsicmp(buf, L"real") == 0;
     }
 
     // -----------------------------------------------------------------------
