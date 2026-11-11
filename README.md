@@ -3,6 +3,16 @@
 Fondos de escritorio animados para Windows que usan **DirectX Raytracing (DXR 1.0)** nativo en la GPU, en tiempo real.
 Incluye varias escenas que se eligen en un archivo de configuración.
 
+## Descargar
+
+**[⬇ RTWallpaper-v1.0.0-win-x64.zip](https://github.com/AdanRuiz/RTWallpaper/releases/latest/download/RTWallpaper-v1.0.0-win-x64.zip)** (≈200 KB): el `.exe` listo para usar, sin dependencias, más `RTWallpaper.ini` y `LEEME.txt`. También está en la página de [Releases](https://github.com/AdanRuiz/RTWallpaper/releases).
+
+1. Descomprime el zip en cualquier carpeta.
+2. Ejecuta `RTWallpaper.exe --wallpaper` para ponerlo de fondo, o `RTWallpaper.exe` para verlo en una ventana.
+3. Elige la escena (`marble` o `space`) en `RTWallpaper.ini` o desde el icono de la bandeja.
+
+Requiere Windows 10/11 y una GPU con DirectX Raytracing (NVIDIA RTX, AMD RX 6000+, Intel Arc). El ejecutable no está firmado, así que Windows SmartScreen puede avisar: usa **Más información → Ejecutar de todas formas**.
+
 ## Capturas
 
 Escena `space` como fondo de escritorio en una configuración de dos monitores (una sola escena repartida entre ambos):
