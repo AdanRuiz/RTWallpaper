@@ -22,7 +22,7 @@ clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld \
   src/main.cpp /Fobuild/main.obj /Febuild/RTWallpaper.exe \
   /link /SUBSYSTEM:WINDOWS \
   /LIBPATH:$X/crt/lib/x86_64 /LIBPATH:$X/sdk/lib/um/x86_64 /LIBPATH:$X/sdk/lib/ucrt/x86_64 \
-  d3d12.lib dxgi.lib user32.lib shell32.lib
+  d3d12.lib dxgi.lib user32.lib shell32.lib ole32.lib windowscodecs.lib winhttp.lib
 
 # Default config next to the exe (never overwrites your edits).
 [ -f build/RTWallpaper.ini ] || cp config/RTWallpaper.ini build/RTWallpaper.ini

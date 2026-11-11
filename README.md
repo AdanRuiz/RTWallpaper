@@ -6,9 +6,9 @@ Incluye varias escenas que se eligen en un archivo de configuración.
 | Escena | Diseño | Qué hay |
 |---|---|---|
 | `marble` | [`ray_tracing_windows_desktop_wallpaper.md`](ray_tracing_windows_desktop_wallpaper.md) | Piso de mármol negro con reflexión Fresnel y sombras; 3 esferas de cuarzo exactas con refracción de Snell, reflexión interna total y absorción de Beer; 2 luces de neón; movimiento con OpenSimplex2 ([FastNoiseLite](https://github.com/Auburn/FastNoiseLite)). |
-| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | La Tierra (procedural: continentes, océanos con brillo del sol, hielo, nubes, luces de ciudades en el lado nocturno, atmósfera Fresnel y halo en el borde); 2 satélites LEO (16 órbitas por rotación terrestre) con foil dorado, paneles solares y reflejos metálicos trazados, eclipses al pasar por la sombra de la Tierra; Sol, estrellas y Vía Láctea; cámara en deriva cinemática. |
+| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km):** mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara sigue a la ISS y mantiene la Tierra en el 40–60 % de la pantalla. |
 
-Las texturas de la Tierra que menciona el diseño (`g_EarthDayMap`/`g_EarthNightMap`) se reemplazaron por superficie procedural, así el `.exe` no depende de archivos externos.
+La escena `space` descarga sus datos la primera vez (~30 MB, unos 45 s) en `%LOCALAPPDATA%\RTWallpaper\cache` y después funciona también sin conexión. Los detalles están en [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md).
 
 ## Requisitos
 
@@ -35,10 +35,20 @@ Está junto al `.exe` (se crea solo si falta). **Los cambios se aplican al guard
 [General]
 ; Escena: marble | space
 Scene=space
-; Límite de FPS (menos = menos GPU)
-FPS=60
+; Límite de FPS (menos = menos GPU; 30 es suficiente: el movimiento es lento)
+FPS=30
 ; Velocidad de la animación (1.0 = como en el diseño, 0.5 = la mitad)
 Speed=1.0
+
+[Space]
+TextureSize=8192          ; mapas de la Tierra (8K)
+CloudSize=8192            ; mapa de nubes en vivo
+CloudUpdateMinutes=60     ; cada cuánto se consultan las nubes
+SatelliteScale=1000       ; tamaño visual de los satélites (a escala real no se verían)
+CoverageMin=0.40          ; fracción de la pantalla que ocupa la Tierra
+CoverageMax=0.60
+Offline=0
+TimeOffsetHours=0         ; ver la Tierra a otra hora
 ```
 
 También puedes cambiar de escena desde el icono de la bandeja (modo fondo) o con **Tab** (modo ventana).
@@ -69,6 +79,9 @@ Como en el documento original: en Lively, **Add Wallpaper → Browse** y elige `
 src/main.cpp             renderer DXR genérico, config .ini, modo wallpaper, bandeja
 src/scenes/Scene.h       interfaz de escena (librería DXIL, hit groups, geometría, animación)
 src/scenes/*Scene.h      escenas: MarbleScene, SpaceScene
+src/space/               astronomía/órbitas (Astro.h), descargas con ETag (Http.h), imágenes WIC + mipmaps (Image.h)
+tests/astro_test.cpp     pruebas de escala física (velocidades orbitales, distancia al Sol, GMST)
+scripts/gen_space_doc.py regenera space_rtx_wallpaper.md con el código real
 src/shaders/*.hlsl       shaders DXR de cada escena (se compilan todos automáticamente)
 config/RTWallpaper.ini   configuración por defecto
 third_party/             FastNoiseLite.h (MIT)

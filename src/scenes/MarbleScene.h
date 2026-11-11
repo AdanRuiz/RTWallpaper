@@ -57,7 +57,7 @@ public:
         return { floor, sphere };
     }
 
-    UINT Update(float deltaTime, void* constants, InstanceDef* instances) override
+    UINT Update(float deltaTime, float, void* constants, InstanceDef* instances) override
     {
         using namespace DirectX;
         Constants& cb = *static_cast<Constants*>(constants);

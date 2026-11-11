@@ -1,25 +1,36 @@
-// DXR shaders for scene "space" (space_rtx_wallpaper.md):
-//   - Earth: exact sphere, procedural continents/oceans/ice/clouds, day/night terminator,
-//     city lights, ocean sun glint, Fresnel atmosphere rim + limb halo
-//   - 2 satellites: gold MLI foil body, solar panels, antenna (boxes via intersection shader),
-//     metallic Fresnel reflections (they reflect the Earth and the Sun), Earth-eclipse shadows
-//   - starfield, Milky Way band and the Sun disk in the miss shader
+// DXR shaders for scene "space" (space_rtx_wallpaper.md). World units: kilometres.
+//   - Earth (R = 6371 km): NASA Blue Marble day map, Black Marble night lights, live cloud map
+//     with cloud shadows, ocean sun glint, physically based single-scattering atmosphere
+//     (Rayleigh + Mie, 100 km thick, Chapman approximation for sunlight transmittance)
+//   - ISS and Hubble: box models at real dimensions (scaled up by the instance transform),
+//     traced metallic reflections, eclipse shadows from the Earth
+//   - Sun with its real angular size, starfield
 // Compiled with: dxc -T lib_6_3
 
 #define MAX_DEPTH 3          // SpaceScene::MaxRecursion() = MAX_DEPTH + 1
 #define PI 3.14159265f
-#define EARTH_RADIUS 10.0f
+
+static const float  RE = 6371.0f;            // Earth radius (km)
+static const float  RA = 6471.0f;            // top of the atmosphere (km)
+static const float  HR = 8.0f;               // Rayleigh scale height (km)
+static const float  HM = 1.2f;               // Mie scale height (km)
+static const float3 BETA_R = float3(5.802e-3f, 13.558e-3f, 33.1e-3f);   // Rayleigh scattering (1/km)
+static const float  BETA_M = 3.996e-3f;      // Mie scattering (1/km)
+static const float  BETA_M_EXT = 4.40e-3f;   // Mie extinction (1/km)
+static const float  CLOUD_HEIGHT = 8.0f;     // km, for cloud shadows
+static const float  T_MAX = 1.0e9f;
 
 struct SceneConstantBuffer
 {
-    float4 cameraPosition;   // xyz, w = tan(fovY / 2)
+    float4 cameraPosition;   // xyz (km), w = tan(fovY / 2)
     float4 cameraForward;
     float4 cameraRight;
     float4 cameraUp;
-    float4 sunDirection;     // xyz towards the sun, w = intensity
-    float4 earthTransform;   // w = rotation (radians)
-    float4 satellitePos[2];
-    float4 params;           // x = time
+    float4 sunDirection;     // xyz towards the sun, w = solar irradiance
+    float4 sunInfo;          // x = angular radius (rad), y = distance (km), z = exposure
+    float4 earthRow[3];      // world -> Earth-fixed (ECEF) rotation rows
+    float4 params;           // x = scene time (s), y = has day map, z = has night map, w = has clouds
+    float4 textureInfo;      // x = day width, y = night width, z = cloud width
 };
 
 struct RayPayload
@@ -41,15 +52,19 @@ struct EarthAttributes
 struct SatAttributes
 {
     float3 normal;     // object space
-    uint   material;   // 0 gold foil, 1 solar panel, 2 metal
+    uint   material;   // 0 gold foil, 1 solar panel, 2 metal, 3 white, 4 silver foil
 };
 
 RaytracingAccelerationStructure     g_scene  : register(t0);
+Texture2D<float4>                   g_day    : register(t1);
+Texture2D<float4>                   g_night  : register(t2);
+Texture2D<float>                    g_clouds : register(t3);
+SamplerState                        g_linear : register(s0);
 RWTexture2D<float4>                 g_output : register(u0);
 ConstantBuffer<SceneConstantBuffer> g_cb     : register(b0);
 
 // ---------------------------------------------------------------------------
-// Noise
+// Utilities
 // ---------------------------------------------------------------------------
 float Hash31(float3 p)
 {
@@ -82,16 +97,13 @@ float Fbm3(float3 p, int octaves)
     return s / norm;
 }
 
-float3 RotY(float3 v, float a)
+// Extended Reinhard on luminance: compresses highlights without shifting hue (clouds stay white).
+float3 ToneMap(float3 x)
 {
-    float c = cos(a), s = sin(a);
-    return float3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
-}
-
-float3 ACESFilm(float3 x)
-{
-    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+    const float white = 4.0f;
+    float l = dot(x, float3(0.2126f, 0.7152f, 0.0722f));
+    float lt = l * (1.0f + l / (white * white)) / (1.0f + l);
+    return saturate(x * (lt / max(l, 1e-5f)));
 }
 
 float3 HitWorldPosition()
@@ -99,13 +111,104 @@ float3 HitWorldPosition()
     return WorldRayOrigin() + RayTCurrent() * WorldRayDirection();
 }
 
+float3 EarthFixed(float3 v)
+{
+    return float3(dot(g_cb.earthRow[0].xyz, v), dot(g_cb.earthRow[1].xyz, v), dot(g_cb.earthRow[2].xyz, v));
+}
+
+// Equirectangular UV: u = 0 at 180 W, v = 0 at the North Pole.
+float2 LatLonUV(float3 ecef)
+{
+    float lat = asin(clamp(ecef.z, -1.0f, 1.0f));
+    float lon = atan2(ecef.y, ecef.x);
+    return float2(lon / (2.0f * PI) + 0.5f, 0.5f - lat / PI);
+}
+
 // ---------------------------------------------------------------------------
-// Background: stars, Milky Way, Sun, atmosphere halo
+// Atmosphere (single scattering)
+// ---------------------------------------------------------------------------
+// Chapman function approximation (C. Schüler): relative air mass along a ray towards zenith
+// angle chi, starting at normalised height h, for a planet of normalised radius X.
+float Chapman(float X, float h, float cosChi)
+{
+    float c = sqrt(X + h);
+    if (cosChi >= 0.0f)
+        return c / (c * cosChi + 1.0f) * exp(-h);
+    float x0 = sqrt(1.0f - cosChi * cosChi) * (X + h);
+    float c0 = sqrt(x0);
+    return 2.0f * c0 * exp(min(X - x0, 80.0f)) - c / (1.0f - c * cosChi) * exp(-h);
+}
+
+// Transmittance of sunlight from the top of the atmosphere down to pos.
+float3 SunTransmittance(float3 pos)
+{
+    float r = length(pos);
+    float h = max(r - RE, 0.0f);
+    float mu = dot(pos / r, g_cb.sunDirection.xyz);
+    float odR = HR * Chapman(RE / HR, h / HR, mu);
+    float odM = HM * Chapman(RE / HM, h / HM, mu);
+    return exp(-min(BETA_R * odR + BETA_M_EXT * odM, 80.0f));
+}
+
+// In-scattered sunlight along o + d*t, t in [0, tMax]; also returns the view transmittance.
+// Samples are packed around the point of closest approach, where the air is densest.
+float3 Atmosphere(float3 o, float3 d, float tMax, out float3 transmittance)
+{
+    transmittance = 1.0f;
+    float b = dot(o, d);
+    float c = dot(o, o) - RA * RA;
+    float disc = b * b - c;
+    if (disc <= 0.0f) return 0;
+    float s = sqrt(disc);
+    float t0 = max(-b - s, 0.0f);
+    float t1 = min(-b + s, tMax);
+    if (t1 <= t0) return 0;
+    float tc = clamp(-b, t0, t1);
+
+    float mu = dot(d, g_cb.sunDirection.xyz);
+    float phaseR = 3.0f / (16.0f * PI) * (1.0f + mu * mu);
+    const float g = 0.76f;
+    float phaseM = (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f));
+
+    const int HALF = 6;   // 12 samples per view ray
+    float odR = 0.0f, odM = 0.0f;
+    float3 sumR = 0, sumM = 0;
+    [unroll]
+    for (int side = 0; side < 2; side++)
+    {
+        float len = side == 0 ? tc - t0 : t1 - tc;
+        float sgn = side == 0 ? -1.0f : 1.0f;
+        if (len <= 0.0f) continue;
+        [loop]
+        for (int k = 0; k < HALF; k++)
+        {
+            int i = side == 0 ? (HALF - 1 - k) : k;     // march from the camera outwards
+            float u0 = (float)i / HALF, u1 = (float)(i + 1) / HALF, um = 0.5f * (u0 + u1);
+            float dt = len * (u1 * u1 - u0 * u0);
+            float3 pos = o + d * (tc + sgn * len * um * um);
+            float h = max(length(pos) - RE, 0.0f);
+            float dR = exp(-h / HR) * dt;
+            float dM = exp(-h / HM) * dt;
+            odR += 0.5f * dR;
+            odM += 0.5f * dM;
+            float3 tr = SunTransmittance(pos) * exp(-min(BETA_R * odR + BETA_M_EXT * odM, 80.0f));
+            sumR += tr * dR;
+            sumM += tr * dM;
+            odR += 0.5f * dR;
+            odM += 0.5f * dM;
+        }
+    }
+    transmittance = exp(-min(BETA_R * odR + BETA_M_EXT * odM, 80.0f));
+    return g_cb.sunDirection.w * (sumR * BETA_R * phaseR + sumM * BETA_M * phaseM);
+}
+
+// ---------------------------------------------------------------------------
+// Background: stars and the Sun (real angular size)
 // ---------------------------------------------------------------------------
 float3 Stars(float3 d)
 {
     float3 col = 0;
-    const float scales[2] = { 180.0f, 420.0f };
+    const float scales[2] = { 220.0f, 520.0f };
     [unroll]
     for (int l = 0; l < 2; l++)
     {
@@ -113,47 +216,37 @@ float3 Stars(float3 d)
         float3 cell = floor(p);
         float3 f = frac(p) - 0.5f;
         float h = Hash31(cell);
-        if (h > 0.97f)
+        if (h > 0.975f)
         {
             float3 off = (float3(Hash31(cell + 1.3f), Hash31(cell + 2.7f), Hash31(cell + 4.1f)) - 0.5f) * 0.6f;
-            float dist = length(f - off);
-            float b = smoothstep(0.16f, 0.0f, dist) * (h - 0.97f) / 0.03f;
+            float b = smoothstep(0.16f, 0.0f, length(f - off)) * (h - 0.975f) / 0.025f;
             float3 tint = lerp(float3(0.65f, 0.75f, 1.0f), float3(1.0f, 0.85f, 0.65f), Hash31(cell + 9.0f));
-            col += tint * b * b * (l == 0 ? 4.0f : 1.5f);
+            col += tint * b * b * (l == 0 ? 2.5f : 1.0f);
         }
     }
-    // Milky Way: noisy band around a tilted great circle.
     float band = exp(-pow(dot(d, normalize(float3(0.35f, 1.0f, 0.25f))), 2.0f) * 45.0f);
-    float dust = Fbm3(d * 9.0f, 5);
-    col += float3(0.09f, 0.08f, 0.12f) * band * smoothstep(0.45f, 0.8f, dust) * 0.45f;
-    col += float3(0.012f, 0.012f, 0.02f) * band;
+    col += float3(0.05f, 0.045f, 0.07f) * band * smoothstep(0.55f, 0.85f, Fbm3(d * 14.0f, 4)) * 0.12f;
     return col;
 }
 
 float3 Sun(float3 d)
 {
-    float s = saturate(dot(d, g_cb.sunDirection.xyz));
-    float disk = smoothstep(0.99985f, 0.99993f, s) * 60.0f;
-    float glare = pow(s, 900.0f) * 6.0f + pow(s, 40.0f) * 0.06f;
-    return float3(1.0f, 0.95f, 0.85f) * (disk + glare);
+    float cosA = dot(d, g_cb.sunDirection.xyz);
+    float r = g_cb.sunInfo.x;                             // ~0.00465 rad at 1 AU
+    return float3(1.0f, 0.96f, 0.9f) * smoothstep(cos(r * 1.15f), cos(r * 0.85f), cosA) * 2000.0f;
+}
+
+// Lens glare around the Sun (camera effect), only when the Sun is actually visible.
+float3 SunGlare(float3 d)
+{
+    float r = g_cb.sunInfo.x;
+    float a = acos(clamp(dot(d, g_cb.sunDirection.xyz), -1.0f, 1.0f));
+    return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.5f * exp(-a / (r * 40.0f)));
 }
 
 float3 Background(float3 d)
 {
     return Stars(d) + Sun(d);
-}
-
-// Thin glowing shell above the limb for rays that pass close to the Earth.
-float3 AtmosphereHalo(float3 o, float3 d, float tMax)
-{
-    float tc = clamp(-dot(o, d), 0.0f, tMax);
-    float3 q = o + d * tc;
-    float h = max(length(q) - EARTH_RADIUS, 0.0f);
-    float3 up = normalize(q);
-    float lit = saturate(dot(up, g_cb.sunDirection.xyz) + 0.25f);
-    float sunset = exp(-abs(dot(up, g_cb.sunDirection.xyz)) * 6.0f);
-    float3 col = lerp(float3(0.25f, 0.55f, 1.0f), float3(1.0f, 0.45f, 0.15f), sunset * 0.6f);
-    return col * exp(-h / 0.22f) * lit * 1.6f + col * exp(-h / 1.2f) * lit * 0.12f;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +258,7 @@ float3 TraceRadiance(float3 origin, float3 dir, uint depth)
     ray.Origin    = origin;
     ray.Direction = dir;
     ray.TMin      = 0.001f;
-    ray.TMax      = 10000.0f;
+    ray.TMax      = T_MAX;
     RayPayload p;
     p.color = 0;
     p.depth = depth;
@@ -179,7 +272,7 @@ float TraceShadow(float3 origin, float3 dir)
     ray.Origin    = origin;
     ray.Direction = dir;
     ray.TMin      = 0.001f;
-    ray.TMax      = 10000.0f;
+    ray.TMax      = T_MAX;
     ShadowPayload p;
     p.visibility = 0.0f;
     TraceRay(g_scene,
@@ -207,8 +300,16 @@ void RayGen()
 
     float3 col = TraceRadiance(g_cb.cameraPosition.xyz, dir, 0);
 
-    col *= 1.0f - 0.15f * dot(ndc * 0.7f, ndc * 0.7f);
-    col = ACESFilm(col);
+    // Glare: a shadow ray towards the Sun (hidden behind the Earth => no glare), only for pixels
+    // within ~35 degrees of the Sun where the glare is not negligible.
+    if (dot(dir, g_cb.sunDirection.xyz) > 0.82f)
+    {
+        float sunVisible = TraceShadow(g_cb.cameraPosition.xyz, g_cb.sunDirection.xyz);
+        col += SunGlare(dir) * sunVisible * SunTransmittance(g_cb.cameraPosition.xyz);
+    }
+
+    col *= 1.0f - 0.12f * dot(ndc * 0.7f, ndc * 0.7f);
+    col = ToneMap(col * g_cb.sunInfo.z);
     col = pow(col, 1.0f / 2.2f);
     col += (Hash31(float3(idx, 0.5f)) - 0.5f) / 255.0f;
     g_output[idx] = float4(col, 1.0f);
@@ -221,7 +322,9 @@ void RayGen()
 void Miss(inout RayPayload payload)
 {
     float3 d = WorldRayDirection();
-    payload.color = Background(d) + AtmosphereHalo(WorldRayOrigin(), d, 10000.0f);
+    float3 T;
+    float3 sky = Atmosphere(WorldRayOrigin(), d, T_MAX, T);
+    payload.color = sky + Background(d) * T;
 }
 
 [shader("miss")]
@@ -231,7 +334,7 @@ void ShadowMiss(inout ShadowPayload payload)
 }
 
 // ---------------------------------------------------------------------------
-// Earth: exact sphere (unit sphere in object space, instance scale = EARTH_RADIUS)
+// Earth: exact sphere (unit sphere in object space, instance scale = 6371 km)
 // ---------------------------------------------------------------------------
 [shader("intersection")]
 void SphereIntersection()
@@ -259,68 +362,110 @@ void SphereIntersection()
     }
 }
 
+float CloudOpacity(float a)
+{
+    return pow(saturate((a - 0.32f) / 0.63f), 1.6f);
+}
+
+// Mip level so that one texel roughly matches the pixel footprint on the ground.
+float TextureLod(float width, float3 N, float3 V)
+{
+    float pixelAngle = 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
+    float footprint = RayTCurrent() * pixelAngle / max(dot(N, V), 0.2f);   // km
+    float texel = 2.0f * PI * RE / max(width, 1.0f);                       // km
+    return log2(max(footprint / texel, 1.0f));
+}
+
+float3 ProceduralAlbedo(float3 ecef, out float ocean)
+{
+    float h = Fbm3(ecef * 2.1f, 6);
+    float land = smoothstep(0.515f, 0.53f, h);
+    ocean = 1.0f - land;
+    float ice = smoothstep(0.80f, 0.86f, abs(ecef.z) + (h - 0.5f) * 0.25f);
+    float3 c = lerp(float3(0.01f, 0.03f, 0.08f), float3(0.12f, 0.14f, 0.07f), land);
+    return lerp(c, float3(0.75f, 0.78f, 0.82f), ice);
+}
+
 [shader("closesthit")]
 void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
 {
     float3 N = normalize(attr.normal);
-    float3 V = -WorldRayDirection();
+    float3 P = N * RE;
+    float3 D = WorldRayDirection();
+    float3 V = -D;
     float3 L = g_cb.sunDirection.xyz;
-    float sunI = g_cb.sunDirection.w;
-    float time = g_cb.params.x;
+    float  E = g_cb.sunDirection.w;
+    float  NdotL = dot(N, L);
 
-    // Planet-fixed coordinates (Earth spins around Y).
-    float3 p = RotY(N, -g_cb.earthTransform.w);
+    float3 ecef = EarthFixed(N);
+    float2 uv = LatLonUV(ecef);
 
-    // Continents, oceans, ice caps.
-    float h = Fbm3(p * 2.1f, 7);
-    float land = smoothstep(0.515f, 0.53f, h);
-    float lat = abs(p.y);
-    float ice = smoothstep(0.80f, 0.86f, lat + (h - 0.5f) * 0.25f);
-    float arid = smoothstep(0.45f, 0.65f, Fbm3(p * 3.3f + 11.0f, 4)) * (1.0f - smoothstep(0.2f, 0.6f, lat));
-    float3 landCol = lerp(float3(0.04f, 0.10f, 0.03f), float3(0.32f, 0.25f, 0.13f), arid);
-    landCol = lerp(landCol, float3(0.20f, 0.18f, 0.16f), smoothstep(0.62f, 0.72f, h));      // mountains
-    float3 oceanCol = lerp(float3(0.004f, 0.016f, 0.05f), float3(0.02f, 0.09f, 0.13f), smoothstep(0.44f, 0.515f, h));
-    float3 albedo = lerp(oceanCol, landCol, land);
-    albedo = lerp(albedo, float3(0.75f, 0.78f, 0.82f), ice);
+    // Surface: NASA Blue Marble (rgb) + ocean mask (a), or procedural fallback.
+    float3 albedo;
+    float ocean;
+    if (g_cb.params.y > 0.5f)
+    {
+        float4 day = g_day.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.x, N, V));
+        albedo = day.rgb;
+        ocean = day.a;
+    }
+    else
+    {
+        albedo = ProceduralAlbedo(ecef, ocean);
+    }
 
-    // Clouds drift a little faster than the ground.
-    float3 pc = RotY(N, -g_cb.earthTransform.w * 1.15f - time * 0.004f);
-    float cl = Fbm3(pc * 3.2f + float3(0, time * 0.01f, 0), 6);
-    float cloud = smoothstep(0.50f, 0.72f, cl);
+    // Live clouds (coverage) and their shadows on the ground.
+    float cloud = 0.0f, cloudShadow = 1.0f;
+    if (g_cb.params.w > 0.5f)
+    {
+        float lodC = TextureLod(g_cb.textureInfo.z, N, V);
+        // The live map is infrared-derived: cold ground and thin cirrus read as partly cloudy.
+        // Keep dense clouds opaque and make thin ones translucent.
+        cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lodC));
+        if (NdotL > 0.0f)
+        {
+            float3 Le = EarthFixed(L);
+            float3 tang = Le - ecef * dot(ecef, Le);
+            float3 ns = normalize(ecef + tang * (CLOUD_HEIGHT / RE) / max(NdotL, 0.1f));
+            cloudShadow = 1.0f - 0.65f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(ns), lodC));
+        }
+    }
 
-    float NdotL = dot(N, L);
-    float diffuse = saturate(NdotL);
-    float day = smoothstep(-0.12f, 0.22f, NdotL);
+    // Direct sunlight, attenuated by the atmosphere above this point, plus blue skylight.
+    float3 Tsun = SunTransmittance(P);
+    float3 irradiance = E * Tsun * saturate(NdotL);
+    float3 skylight = E * float3(0.03f, 0.05f, 0.09f) * saturate(NdotL + 0.15f);
+    float3 color = albedo * (irradiance * cloudShadow + skylight);
 
-    float3 color = albedo * sunI * diffuse;
-
-    // Ocean sun glint.
+    // Ocean sun glint (normalised Blinn-Phong + Schlick Fresnel for water).
     float3 H = normalize(L + V);
-    float glint = pow(saturate(dot(N, H)), 140.0f) * 1.4f + pow(saturate(dot(N, H)), 20.0f) * 0.05f;
-    color += float3(1.0f, 0.9f, 0.75f) * glint * (1.0f - land) * (1.0f - ice) * (1.0f - cloud) * sunI * saturate(NdotL * 4.0f);
+    float F = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);
+    const float shininess = 700.0f;
+    float spec = pow(saturate(dot(N, H)), shininess) * (shininess + 8.0f) / (8.0f * PI) * F;
+    color += irradiance * spec * ocean * cloudShadow * (1.0f - cloud);
 
-    // Clouds (lit white, warm near the terminator).
-    float3 cloudLit = lerp(float3(1.0f, 0.55f, 0.3f), float3(0.95f, 0.96f, 1.0f), smoothstep(0.0f, 0.3f, NdotL));
-    color = lerp(color, cloudLit * sunI * diffuse * 0.85f, cloud);
+    // Clouds: bright, slightly forward-scattering, light wraps a bit past the terminator.
+    float3 cloudLight = (E * SunTransmittance(P + N * CLOUD_HEIGHT) * saturate(NdotL + 0.05f) + skylight * 2.0f) * 0.8f;
+    color = lerp(color, cloudLight, cloud);
 
-    // City lights on the night side.
-    float coast = 1.0f - smoothstep(0.53f, 0.60f, h);   // cities cluster near coasts
-    float urban = smoothstep(0.52f, 0.66f, Fbm3(p * 9.0f + 5.0f, 4)) * land * (1.0f - ice) * (1.0f - arid * 0.8f) * (0.4f + coast);
-    float sparks = smoothstep(0.55f, 0.95f, Noise3(p * 260.0f)) * 1.6f + smoothstep(0.5f, 1.0f, Noise3(p * 90.0f)) * 0.35f;
-    float3 night = float3(1.0f, 0.62f, 0.28f) * urban * sparks * (1.0f - day) * (1.0f - cloud * 0.85f) * 0.45f;
-    color += night;
+    // City lights (NASA Black Marble): keep the warm lights, drop the bluish moonlit terrain.
+    if (g_cb.params.z > 0.5f)
+    {
+        float3 night = g_night.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.y, N, V)).rgb;
+        float lights = saturate((night.r + night.g) * 0.5f - night.b * 0.75f) * 6.0f;
+        float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
+        color += float3(1.0f, 0.70f, 0.38f) * lights * dark * (1.0f - 0.8f * cloud) * 1.5f;
+    }
 
-    // Atmosphere (simplified Rayleigh via Fresnel, as in the design doc) + sunset band.
-    float fresnel = pow(1.0f - saturate(dot(N, V)), 4.0f);
-    float3 atmosphere = float3(0.3f, 0.6f, 1.0f) * fresnel * saturate(NdotL + 0.2f) * 1.5f;
-    atmosphere += float3(1.0f, 0.4f, 0.1f) * fresnel * exp(-abs(NdotL) * 8.0f) * 0.5f;
-    color += atmosphere + float3(0.02f, 0.05f, 0.11f) * day * 0.6f;    // daytime blue haze
-
-    payload.color = color;
+    // Aerial perspective: view-ray transmittance + in-scattering.
+    float3 T;
+    float3 inscatter = Atmosphere(WorldRayOrigin(), D, RayTCurrent(), T);
+    payload.color = color * T + inscatter;
 }
 
 // ---------------------------------------------------------------------------
-// Satellites: union of boxes in object space (+Y away from Earth, +Z along velocity)
+// Satellites: union of boxes, real dimensions in km
+// (+Y away from the Earth, +Z along the velocity, +X along the orbit normal)
 // ---------------------------------------------------------------------------
 struct Box
 {
@@ -329,13 +474,30 @@ struct Box
     uint   m;
 };
 
-static const Box kBoxes[6] = {
-    { float3(0.00f,  0.00f, 0.0f), float3(0.30f, 0.35f, 0.42f), 0 },  // body (gold foil)
-    { float3(1.45f,  0.00f, 0.0f), float3(1.05f, 0.015f, 0.38f), 1 }, // solar panel +X
-    { float3(-1.45f, 0.00f, 0.0f), float3(1.05f, 0.015f, 0.38f), 1 }, // solar panel -X
-    { float3(0.00f,  0.00f, 0.0f), float3(0.42f, 0.03f, 0.03f), 2 },  // panel boom
-    { float3(0.00f, -0.50f, 0.0f), float3(0.04f, 0.16f, 0.04f), 2 },  // antenna mast (towards Earth)
-    { float3(0.00f, -0.68f, 0.0f), float3(0.24f, 0.025f, 0.24f), 2 }, // antenna dish
+// International Space Station: 109 m truss, 8 solar wings (35 x 12 m), modules, radiators.
+static const Box kIss[13] = {
+    { float3( 0.000f,  0.0000f,  0.000f), float3(0.0545f, 0.0022f, 0.0022f), 2 },  // integrated truss
+    { float3( 0.000f, -0.0045f,  0.000f), float3(0.0022f, 0.0022f, 0.0260f), 3 },  // pressurised modules
+    { float3( 0.000f, -0.0045f,  0.012f), float3(0.0110f, 0.0020f, 0.0020f), 3 },  // node / lab cross
+    { float3( 0.040f,  0.0000f,  0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 }, // solar wings
+    { float3( 0.040f,  0.0000f, -0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3( 0.052f,  0.0000f,  0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3( 0.052f,  0.0000f, -0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3(-0.040f,  0.0000f,  0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3(-0.040f,  0.0000f, -0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3(-0.052f,  0.0000f,  0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3(-0.052f,  0.0000f, -0.0205f), float3(0.0058f, 0.0002f, 0.0173f), 1 },
+    { float3( 0.018f, -0.0030f, -0.0070f), float3(0.0065f, 0.0002f, 0.0110f), 3 }, // radiators
+    { float3(-0.018f, -0.0030f, -0.0070f), float3(0.0065f, 0.0002f, 0.0110f), 3 },
+};
+
+// Hubble Space Telescope: 13.2 m x 4.2 m tube, aperture door, 2 solar arrays (7.1 x 2.6 m).
+static const Box kHubble[5] = {
+    { float3( 0.0000f, 0.0000f,  0.0000f), float3(0.0021f, 0.0021f, 0.0066f), 4 },  // optical tube
+    { float3( 0.0000f, 0.0000f, -0.0072f), float3(0.0022f, 0.0022f, 0.0006f), 4 },  // aft shroud
+    { float3( 0.0000f, 0.0016f,  0.0076f), float3(0.0021f, 0.0004f, 0.0012f), 2 },  // aperture door
+    { float3( 0.0058f, 0.0000f,  0.0000f), float3(0.0035f, 0.0002f, 0.0013f), 1 },  // solar arrays
+    { float3(-0.0058f, 0.0000f,  0.0000f), float3(0.0035f, 0.0002f, 0.0013f), 1 },
 };
 
 bool RayBox(float3 o, float3 inv, Box b, out float tn, out float3 n)
@@ -362,16 +524,19 @@ void SatelliteIntersection()
     SatAttributes attr;
     attr.normal = float3(0, 1, 0);
     attr.material = 0;
-    [unroll]
-    for (int i = 0; i < 6; i++)
+    uint count = InstanceID() == 0 ? 13 : 5;
+    for (uint i = 0; i < count; i++)
     {
+        Box b;
+        if (InstanceID() == 0) b = kIss[i];
+        else b = kHubble[i];
         float tn;
         float3 n;
-        if (RayBox(o, inv, kBoxes[i], tn, n) && tn >= RayTMin() && tn < best)
+        if (RayBox(o, inv, b, tn, n) && tn >= RayTMin() && tn < best)
         {
             best = tn;
             attr.normal = n;
-            attr.material = kBoxes[i].m;
+            attr.material = b.m;
             hit = true;
         }
     }
@@ -388,21 +553,27 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
     float3 nObj = attr.normal;
 
     float3 albedo, F0;
-    if (attr.material == 0)
+    if (attr.material == 0 || attr.material == 4)
     {
-        // Crinkled gold MLI foil.
-        float3 pert = float3(Noise3(objP * 34.0f), Noise3(objP * 34.0f + 7.1f), Noise3(objP * 34.0f + 3.3f)) - 0.5f;
-        nObj = normalize(nObj + pert * 0.28f);
-        albedo = float3(0.20f, 0.14f, 0.04f);
-        F0 = float3(1.0f, 0.74f, 0.30f);
+        // Crinkled multi-layer insulation: gold (0) or silver (4).
+        float3 q = objP * 2500.0f;
+        float3 pert = float3(Noise3(q), Noise3(q + 7.1f), Noise3(q + 3.3f)) - 0.5f;
+        nObj = normalize(nObj + pert * 0.25f);
+        albedo = attr.material == 0 ? float3(0.20f, 0.14f, 0.04f) : float3(0.25f, 0.25f, 0.27f);
+        F0 = attr.material == 0 ? float3(1.0f, 0.74f, 0.30f) : float3(0.90f, 0.90f, 0.92f);
     }
     else if (attr.material == 1)
     {
-        // Solar cells with a silver grid.
-        float2 g = frac(objP.xz * float2(3.6f, 3.0f));
-        float grid = (g.x < 0.05f || g.y < 0.06f) ? 1.0f : 0.0f;
-        albedo = lerp(float3(0.01f, 0.018f, 0.06f), float3(0.35f, 0.35f, 0.38f), grid);
+        // Solar cells with a silver grid (~1.5 m cells).
+        float2 g = frac(objP.xz * 650.0f);
+        float grid = (g.x < 0.06f || g.y < 0.06f) ? 1.0f : 0.0f;
+        albedo = lerp(float3(0.02f, 0.025f, 0.07f), float3(0.35f, 0.35f, 0.38f), grid);
         F0 = lerp(float3(0.05f, 0.06f, 0.09f), float3(0.75f, 0.75f, 0.78f), grid);
+    }
+    else if (attr.material == 3)
+    {
+        albedo = float3(0.55f, 0.55f, 0.55f);
+        F0 = float3(0.06f, 0.06f, 0.06f);
     }
     else
     {
@@ -414,27 +585,24 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
     if (dot(N, D) > 0.0f) N = -N;
 
     float3 L = g_cb.sunDirection.xyz;
-    float sunI = g_cb.sunDirection.w;
-    float NdotL = saturate(dot(N, L));
-    bool canTrace = payload.depth < MAX_DEPTH;
-    float vis = (NdotL > 0.0f && canTrace) ? TraceShadow(P + N * 0.002f, L) : (NdotL > 0.0f ? 1.0f : 0.0f);
+    float  E = g_cb.sunDirection.w;
+    float  NdotL = saturate(dot(N, L));
+    bool   canTrace = payload.depth < MAX_DEPTH;
+    float  vis = NdotL > 0.0f ? (canTrace ? TraceShadow(P + N * 0.01f, L) : 1.0f) : 0.0f;   // Earth eclipse
+    float3 sun = E * SunTransmittance(P) * vis;
 
-    // Metallic Fresnel reflection (traced: reflects the Earth, the other satellite, stars and Sun).
+    // Traced metallic reflection: the Earth, the other satellite, stars and the Sun.
     float3 F = F0 + (1.0f - F0) * pow(1.0f - saturate(dot(N, V)), 5.0f);
     float3 R = reflect(D, N);
-    float3 refl = canTrace ? TraceRadiance(P + N * 0.002f, R, payload.depth + 1) : Background(R);
+    float3 refl = canTrace ? TraceRadiance(P + N * 0.01f, R, payload.depth + 1) : Background(R);
 
-    // Earthshine: light bounced off the lit side of the Earth.
-    float3 toEarth = -normalize(P);
-    float earthLit = saturate(dot(-toEarth, L) * 0.5f + 0.5f);
-    float3 earthshine = float3(0.10f, 0.16f, 0.28f) * earthLit * saturate(dot(N, toEarth) * 0.5f + 0.5f);
+    // Earthshine: sunlight reflected by the lit side of the Earth (albedo ~0.3).
+    float3 up = normalize(P);
+    float earthLit = saturate(dot(up, L) * 0.5f + 0.5f);
+    float3 earthshine = E * 0.3f * earthLit * saturate(dot(N, -up) * 0.5f + 0.5f) * float3(0.6f, 0.75f, 1.0f) * 0.4f;
 
     float3 H = normalize(L + V);
     float spec = pow(saturate(dot(N, H)), 250.0f) * 6.0f;
 
-    float3 color = albedo * (sunI * NdotL * vis + earthshine)
-                 + refl * F
-                 + F * spec * sunI * vis
-                 + float3(0.05f, 0.05f, 0.05f) * albedo;
-    payload.color = color;
+    payload.color = albedo * (sun * NdotL + earthshine) + refl * F + F * spec * sun;
 }

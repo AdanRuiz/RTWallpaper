@@ -39,9 +39,9 @@ static const wchar_t*  kStopEvent   = L"Local\\RTWallpaper.Stop";
 // ---------------------------------------------------------------------------
 static const wchar_t* kSceneNames[] = { L"marble", L"space" };
 
-static std::unique_ptr<Scene> CreateScene(const std::wstring& name)
+static std::unique_ptr<Scene> CreateScene(const std::wstring& name, const std::wstring& iniPath)
 {
-    if (!_wcsicmp(name.c_str(), L"space")) return std::make_unique<SpaceScene>();
+    if (!_wcsicmp(name.c_str(), L"space")) return std::make_unique<SpaceScene>(iniPath);
     return std::make_unique<MarbleScene>();   // default / unknown names
 }
 
@@ -94,9 +94,26 @@ static const char kDefaultIni[] =
     "; Scene to render: marble | space\r\n"
     "Scene=marble\r\n"
     "; Frame rate cap (lower = less GPU usage)\r\n"
-    "FPS=60\r\n"
-    "; Animation speed multiplier (1.0 = as designed, 0.5 = half speed)\r\n"
-    "Speed=1.0\r\n";
+    "FPS=30\r\n"
+    "; Animation speed multiplier (1.0 = as designed / real time, 0.5 = half speed)\r\n"
+    "Speed=1.0\r\n"
+    "\r\n"
+    "[Space]\r\n"
+    "; Earth day/night map width in pixels (height = width/2). 8192 = 8K\r\n"
+    "TextureSize=8192\r\n"
+    "; Live cloud map width: 1024 | 2048 | 4096 | 8192\r\n"
+    "CloudSize=8192\r\n"
+    "; Minutes between cloud map checks (only re-downloaded if it changed)\r\n"
+    "CloudUpdateMinutes=60\r\n"
+    "; Visual size multiplier for the satellites (1 = real size, sub-pixel)\r\n"
+    "SatelliteScale=1000\r\n"
+    "; Fraction of the screen covered by the Earth (the camera varies between both)\r\n"
+    "CoverageMin=0.40\r\n"
+    "CoverageMax=0.60\r\n"
+    "; 1 = never download (use the cache or the procedural Earth)\r\n"
+    "Offline=0\r\n"
+    "; Show the Earth at another time, in hours from now (0 = live)\r\n"
+    "TimeOffsetHours=0\r\n";
 
 static std::wstring ConfigPath()
 {
@@ -145,7 +162,9 @@ public:
     void LoadScene(const Scene& scene);
     void Resize(UINT w, UINT h);
     void Render(const void* constants, UINT constantsSize, const InstanceDef* instances, UINT count);
+    void UploadTexture(const TextureUpload& t);
     void WaitGpu();
+    float Aspect() const { return (float)m_width / (float)std::max(1u, m_height); }
     const wchar_t* AdapterName() const { return m_adapterName; }
 
 private:
@@ -156,6 +175,13 @@ private:
     void CreateRootSignature();
     void CreatePipeline(const Scene& scene);
     void BuildGeometry(const Scene& scene);
+    void ClearTextures();
+    D3D12_CPU_DESCRIPTOR_HANDLE CpuDescriptor(UINT i) const
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = m_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)i * m_descriptorSize;
+        return h;
+    }
 
     HWND m_hwnd = nullptr;
     UINT m_width = 0, m_height = 0;
@@ -172,8 +198,10 @@ private:
     UINT64 m_fenceValue = 0;
     HANDLE m_fenceEvent = nullptr;
 
-    ComPtr<ID3D12DescriptorHeap> m_heap;
+    ComPtr<ID3D12DescriptorHeap> m_heap;     // [0] output UAV, [1..4] scene textures t1..t4
+    UINT m_descriptorSize = 0;
     ComPtr<ID3D12Resource> m_output;
+    ComPtr<ID3D12Resource> m_textures[kMaxSceneTextures];
     ComPtr<ID3D12RootSignature> m_rootSig;
     ComPtr<ID3D12Resource> m_constantBuffer;
     uint8_t* m_cbData = nullptr;
@@ -286,15 +314,99 @@ void Renderer::Init(HWND hwnd, bool debug)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 1;
+    hd.NumDescriptors = 1 + kMaxSceneTextures;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     CHECK(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_heap)));
+    m_descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     m_constantBuffer = MakeBuffer(kMaxSceneConstants, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     CHECK(m_constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&m_cbData)));
 
     CreateOutput();
     CreateRootSignature();
+    ClearTextures();
+}
+
+void Renderer::ClearTextures()
+{
+    // Null descriptors: sampling an unbound slot returns 0 instead of faulting.
+    for (UINT i = 0; i < kMaxSceneTextures; i++)
+    {
+        m_textures[i].Reset();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(nullptr, &srv, CpuDescriptor(1 + i));
+    }
+}
+
+void Renderer::UploadTexture(const TextureUpload& t)
+{
+    if (t.slot >= kMaxSceneTextures || t.mips.empty()) return;
+    WaitGpu();
+
+    const UINT mipCount = (UINT)t.mips.size();
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = t.mips[0].width;
+    td.Height = t.mips[0].height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = (UINT16)mipCount;
+    td.Format = t.format;
+    td.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> tex;
+    CHECK(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&tex)));
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fp(mipCount);
+    std::vector<UINT> rows(mipCount);
+    std::vector<UINT64> rowBytes(mipCount);
+    UINT64 total = 0;
+    m_device->GetCopyableFootprints(&td, 0, mipCount, 0, fp.data(), rows.data(), rowBytes.data(), &total);
+    ComPtr<ID3D12Resource> upload = MakeBuffer(total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    uint8_t* dst = nullptr;
+    CHECK(upload->Map(0, nullptr, reinterpret_cast<void**>(&dst)));
+    for (UINT m = 0; m < mipCount; m++)
+    {
+        const TextureUpload::Mip& mip = t.mips[m];
+        const size_t srcPitch = (size_t)mip.width * t.bytesPerPixel;
+        for (UINT y = 0; y < rows[m]; y++)
+            memcpy(dst + fp[m].Offset + (size_t)y * fp[m].Footprint.RowPitch, mip.data.data() + y * srcPitch, srcPitch);
+    }
+    upload->Unmap(0, nullptr);
+
+    CHECK(m_alloc->Reset());
+    CHECK(m_list->Reset(m_alloc.Get(), nullptr));
+    for (UINT m = 0; m < mipCount; m++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
+        from.pResource = upload.Get();
+        from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint = fp[m];
+        to.pResource = tex.Get();
+        to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.SubresourceIndex = m;
+        m_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER b = Transition(tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_list->ResourceBarrier(1, &b);
+    CHECK(m_list->Close());
+    ID3D12CommandList* lists[] = { m_list.Get() };
+    m_queue->ExecuteCommandLists(1, lists);
+    WaitGpu();   // the upload buffer can go away after this
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = t.format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = mipCount;
+    m_device->CreateShaderResourceView(tex.Get(), &srv, CpuDescriptor(1 + t.slot));
+    m_textures[t.slot] = tex;
 }
 
 void Renderer::CreateOutput()
@@ -321,19 +433,36 @@ void Renderer::CreateOutput()
 
 void Renderer::CreateRootSignature()
 {
-    // Shared by all scenes: u0 (output, table), t0 (TLAS), b0 (scene constants).
+    // Shared by all scenes: u0 (output, table), t0 (TLAS), b0 (scene constants),
+    // t1..t4 (scene textures, table) and a static linear sampler s0.
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     range.NumDescriptors = 1;
-    D3D12_ROOT_PARAMETER params[3] = {};
+    D3D12_DESCRIPTOR_RANGE texRange = {};
+    texRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    texRange.NumDescriptors = kMaxSceneTextures;
+    texRange.BaseShaderRegister = 1;
+    D3D12_ROOT_PARAMETER params[4] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[0].DescriptorTable.NumDescriptorRanges = 1;
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &texRange;
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;    // longitude wraps
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;   // latitude clamps at the poles
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 3;
+    rsd.NumParameters = 4;
     rsd.pParameters = params;
+    rsd.NumStaticSamplers = 1;
+    rsd.pStaticSamplers = &sampler;
     ComPtr<ID3DBlob> blob, err;
     HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
     if (FAILED(hr)) Fail(err ? (const char*)err->GetBufferPointer() : "D3D12SerializeRootSignature", hr);
@@ -351,6 +480,7 @@ void Renderer::LoadScene(const Scene& scene)
     m_tlasScratch.Reset();
     m_instanceBuffer.Reset();
     m_instances = nullptr;
+    ClearTextures();
     CreatePipeline(scene);
     BuildGeometry(scene);
 }
@@ -546,6 +676,9 @@ void Renderer::Render(const void* constants, UINT constantsSize, const InstanceD
     m_list->SetComputeRootDescriptorTable(0, m_heap->GetGPUDescriptorHandleForHeapStart());
     m_list->SetComputeRootShaderResourceView(1, m_tlas->GetGPUVirtualAddress());
     m_list->SetComputeRootConstantBufferView(2, m_constantBuffer->GetGPUVirtualAddress());
+    D3D12_GPU_DESCRIPTOR_HANDLE texTable = m_heap->GetGPUDescriptorHandleForHeapStart();
+    texTable.ptr += m_descriptorSize;
+    m_list->SetComputeRootDescriptorTable(3, texTable);
     m_list->SetPipelineState1(m_pso.Get());
 
     const D3D12_GPU_VIRTUAL_ADDRESS st = m_shaderTable->GetGPUVirtualAddress();
@@ -636,6 +769,7 @@ struct App
     alignas(16) uint8_t constants[kMaxSceneConstants] = {};
     std::vector<InstanceDef> instances;
     Config config;
+    std::wstring sceneSection;   // contents of the scene's own ini section (recreate scene if it changes)
     std::wstring configPath;
     FILETIME configTime = {};
     HWND hwnd = nullptr;
@@ -657,9 +791,18 @@ static void UpdateTitle()
     SetWindowTextW(g_app.hwnd, title);
 }
 
+static std::wstring ReadSection(const std::wstring& name)
+{
+    wchar_t buf[4096] = {};
+    DWORD n = GetPrivateProfileSectionW(name.c_str(), buf, _countof(buf), g_app.configPath.c_str());
+    return std::wstring(buf, n);
+}
+
 static void SwitchScene(const std::wstring& name)
 {
-    g_app.scene = CreateScene(name);
+    g_app.scene.reset();   // stop the old scene's background work first
+    g_app.scene = CreateScene(name, g_app.configPath);
+    g_app.sceneSection = ReadSection(g_app.scene->Name());
     g_app.instances.assign(g_app.scene->InstanceCount(), InstanceDef{});
     memset(g_app.constants, 0, sizeof(g_app.constants));
     g_app.renderer.LoadScene(*g_app.scene);
@@ -674,7 +817,8 @@ static void SelectScene(const wchar_t* name)
 
 static void ApplyConfig(const Config& c)
 {
-    bool sceneChanged = !g_app.scene || _wcsicmp(c.scene.c_str(), g_app.config.scene.c_str()) != 0;
+    bool sceneChanged = !g_app.scene || _wcsicmp(c.scene.c_str(), g_app.config.scene.c_str()) != 0 ||
+                        ReadSection(g_app.scene->Name()) != g_app.sceneSection;
     g_app.config = c;
     if (sceneChanged) SwitchScene(c.scene);
 }
@@ -914,7 +1058,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         QueryPerformanceCounter(&now);
         float dt = (float)((now.QuadPart - last.QuadPart) / (double)freq.QuadPart);
         last = now;
-        UINT cbSize = g_app.scene->Update(std::min(dt, 0.1f) * g_app.config.speed, g_app.constants, g_app.instances.data());
+        std::vector<TextureUpload> uploads;
+        g_app.scene->PollTextures(uploads);
+        for (const TextureUpload& t : uploads) g_app.renderer.UploadTexture(t);
+        UINT cbSize = g_app.scene->Update(std::min(dt, 0.1f) * g_app.config.speed, g_app.renderer.Aspect(),
+                                          g_app.constants, g_app.instances.data());
         g_app.renderer.Render(g_app.constants, cbSize, g_app.instances.data(), (UINT)g_app.instances.size());
         framesRendered++;
 
