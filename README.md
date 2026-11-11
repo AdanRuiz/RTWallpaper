@@ -24,7 +24,7 @@ Las texturas de la Tierra que menciona el diseño (`g_EarthDayMap`/`g_EarthNight
 La primera vez crea la imagen `rtwallpaper-toolchain` (Ubuntu + `clang-cl`/`lld-link` + MSVC CRT y Windows SDK descargados con [xwin](https://github.com/Jake-Shadle/xwin) + [DXC](https://github.com/microsoft/DirectXShaderCompiler) para Linux).
 Al construirla aceptas la licencia de Microsoft del SDK/CRT. Después compila:
 
-1. `src/Raytracing.hlsl` → DXIL (`lib_6_3`, firmado con `libdxil.so`) embebido como header.
+1. `src/shaders/*.hlsl` → DXIL (`lib_6_3`, firmado con `libdxil.so`) embebido como header.
 2. `src/main.cpp` → `build/RTWallpaper.exe` (x64, CRT estático, sin dependencias).
 
 ## Configuración (`RTWallpaper.ini`)
