@@ -1,7 +1,7 @@
-// Sanity checks for src/space/Astro.h (built and run on Linux inside the toolchain container):
+// Sanity checks for src/space/Astro.hpp (built and run on Linux inside the toolchain container):
 //   clang++-18 -std=c++17 -O2 -Isrc tests/astro_test.cpp -o /tmp/astro_test && /tmp/astro_test
 #include <cstdio>
-#include "space/Astro.h"
+#include "space/Astro.hpp"
 
 using namespace astro;
 

@@ -5,3 +5,8 @@ COPY setup-toolchain.sh /tmp/setup-toolchain.sh
 RUN bash /tmp/setup-toolchain.sh && rm /tmp/setup-toolchain.sh
 ENV LD_LIBRARY_PATH=/dxc/lib
 WORKDIR /src
+# The build only reads the toolchain and writes into the mounted /src: no root needed.
+# "ubuntu" (uid 1000) ships with the base image.
+USER ubuntu
+# One-shot build container, nothing to health-check.
+HEALTHCHECK NONE

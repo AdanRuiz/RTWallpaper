@@ -16,9 +16,18 @@ if ($Rebuild -or $LASTEXITCODE -ne 0) {
         docker rm -f rtw-setup *> $null
         docker run --name rtw-setup --dns 1.1.1.1 -v "${root}\docker:/setup:ro" ubuntu:24.04 bash /setup/setup-toolchain.sh
         if ($LASTEXITCODE -ne 0) { throw 'Toolchain setup failed' }
-        docker commit -c 'ENV LD_LIBRARY_PATH=/dxc/lib' -c 'WORKDIR /src' rtw-setup $image | Out-Null
+        docker commit -c 'ENV LD_LIBRARY_PATH=/dxc/lib' -c 'WORKDIR /src' -c 'USER ubuntu' rtw-setup $image | Out-Null
         docker rm rtw-setup | Out-Null
     }
+}
+
+New-Item -ItemType Directory -Force "$root\build" | Out-Null
+# The container builds as the non-root "ubuntu" user; builds before v1.0.1 ran as root and left
+# build\ owned by root inside the mount, so hand it over once.
+docker run --rm -v "${root}:/src" $image test -w build
+if ($LASTEXITCODE -ne 0) {
+    Write-Host '==> Fixing ownership of build\ (created by an older root build)...'
+    docker run --rm --user 0 -v "${root}:/src" $image chown -R 1000:1000 build
 }
 
 Write-Host '==> Compiling shaders + exe...'

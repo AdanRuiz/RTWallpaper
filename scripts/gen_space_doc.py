@@ -7,11 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [
     ("8.1 Shaders HLSL", "src/shaders/Space.hlsl", "hlsl"),
-    ("8.2 Escena y cámara (C++)", "src/scenes/SpaceScene.h", "cpp"),
-    ("8.3 Astronomía y mecánica orbital (C++)", "src/space/Astro.h", "cpp"),
-    ("8.4 Descargas HTTP con ETag (C++)", "src/space/Http.h", "cpp"),
-    ("8.5 Decodificación de imágenes y mipmaps (C++)", "src/space/Image.h", "cpp"),
-    ("8.6 Interfaz de escena (C++)", "src/scenes/Scene.h", "cpp"),
+    ("8.1b Funciones HLSL compartidas", "src/shaders/Common.hlsli", "hlsl"),
+    ("8.2 Escena y cámara (C++)", "src/scenes/SpaceScene.hpp", "cpp"),
+    ("8.3 Astronomía y mecánica orbital (C++)", "src/space/Astro.hpp", "cpp"),
+    ("8.4 Descargas HTTP con ETag (C++)", "src/space/Http.hpp", "cpp"),
+    ("8.5 Decodificación de imágenes y mipmaps (C++)", "src/space/Image.hpp", "cpp"),
+    ("8.6 Interfaz de escena (C++)", "src/scenes/Scene.hpp", "cpp"),
     ("8.7 Pruebas de escala física (C++)", "tests/astro_test.cpp", "cpp"),
 ]
 

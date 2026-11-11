@@ -5,7 +5,7 @@
 #include <wrl/client.h>
 #include <string>
 #include <vector>
-#include "scenes/Scene.h"
+#include "scenes/Scene.hpp"
 
 namespace image
 {

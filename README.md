@@ -101,14 +101,15 @@ Como en el documento original: en Lively, **Add Wallpaper → Browse** y elige `
 
 ```
 src/main.cpp             renderer DXR genérico, config .ini, modo wallpaper, bandeja
-src/scenes/Scene.h       interfaz de escena (librería DXIL, hit groups, geometría, animación)
-src/scenes/*Scene.h      escenas: MarbleScene, SpaceScene
-src/space/               astronomía/órbitas (Astro.h), descargas con ETag (Http.h), imágenes WIC + mipmaps (Image.h)
+src/scenes/Scene.hpp     interfaz de escena (librería DXIL, hit groups, geometría, animación)
+src/scenes/*Scene.hpp    escenas: MarbleScene, SpaceScene
+src/space/               astronomía/órbitas (Astro.hpp), descargas con ETag (Http.hpp), imágenes WIC + mipmaps (Image.hpp)
 tests/astro_test.cpp     pruebas de escala física (velocidades orbitales, distancia al Sol, GMST)
 scripts/gen_space_doc.py regenera space_rtx_wallpaper.md con el código real
 src/shaders/*.hlsl       shaders DXR de cada escena (se compilan todos automáticamente)
+src/shaders/Common.hlsli funciones compartidas por los shaders (rayo de cámara, sombras, esfera)
 config/RTWallpaper.ini   configuración por defecto
-third_party/             FastNoiseLite.h (MIT)
+third_party/             FastNoiseLite.hpp (MIT)
 docker/                  toolchain de compilación cruzada
 scripts/build.sh         compilación dentro del contenedor
 build.ps1                punto de entrada en Windows

@@ -24,7 +24,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 
 ## 2. Escala física (verificada)
 
-`tests/astro_test.cpp` comprueba estos valores contra el código de propagación (`src/space/Astro.h`):
+`tests/astro_test.cpp` comprueba estos valores contra el código de propagación (`src/space/Astro.hpp`):
 
 | Magnitud | Valor calculado | Referencia |
 |---|---|---|
@@ -190,6 +190,8 @@ Texture2D<float>                    g_clouds : register(t3);
 SamplerState                        g_linear : register(s0);
 RWTexture2D<float4>                 g_output : register(u0);
 ConstantBuffer<SceneConstantBuffer> g_cb     : register(b0);
+
+#include "Common.hlsli"
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -468,17 +470,7 @@ float3 TraceRadiance(float3 origin, float3 dir, uint depth)
 
 float TraceShadow(float3 origin, float3 dir)
 {
-    RayDesc ray;
-    ray.Origin    = origin;
-    ray.Direction = dir;
-    ray.TMin      = 0.001f;
-    ray.TMax      = T_MAX;
-    ShadowPayload p;
-    p.visibility = 0.0f;
-    TraceRay(g_scene,
-             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-             0xFF, 0, 1, 1, ray, p);
-    return p.visibility;
+    return TraceVisibility(origin, dir, T_MAX, 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,13 +482,8 @@ void RayGen()
     uint2 idx = DispatchRaysIndex().xy;
     uint2 dim = DispatchRaysDimensions().xy;
 
-    float2 ndc = ((float2(idx) + 0.5f) / float2(dim)) * 2.0f - 1.0f;
-    ndc.y = -ndc.y;
-    float aspect = float(dim.x) / float(dim.y);
-    float tanH = g_cb.cameraPosition.w;
-    float3 dir = normalize(g_cb.cameraForward.xyz
-                         + ndc.x * aspect * tanH * g_cb.cameraRight.xyz
-                         + ndc.y * tanH * g_cb.cameraUp.xyz);
+    float2 ndc;
+    float3 dir = CameraRayDirection(idx, dim, ndc);
 
     float3 col = TraceRadiance(g_cb.cameraPosition.xyz, dir, 0);
 
@@ -539,27 +526,10 @@ void ShadowMiss(inout ShadowPayload payload)
 [shader("intersection")]
 void SphereIntersection()
 {
-    float3 o = ObjectRayOrigin();
-    float3 d = ObjectRayDirection();
-    float a = dot(d, d);
-    float b = dot(o, d);
-    float c = dot(o, o) - 1.0f;
-    float disc = b * b - a * c;
-    if (disc < 0.0f) return;
-    float sq = sqrt(disc);
-    float t0 = (-b - sq) / a;
-    float t1 = (-b + sq) / a;
     EarthAttributes attr;
-    if (t0 >= RayTMin() && t0 <= RayTCurrent())
-    {
-        attr.normal = normalize(o + t0 * d);
-        ReportHit(t0, 0, attr);
-    }
-    else if (t1 >= RayTMin() && t1 <= RayTCurrent())
-    {
-        attr.normal = normalize(o + t1 * d);
-        ReportHit(t1, 0, attr);
-    }
+    float t;
+    if (UnitSphereHit(t, attr.normal))
+        ReportHit(t, 0, attr);
 }
 
 float CloudOpacity(float a)
@@ -808,7 +778,68 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
 }
 ```
 
-### 8.2 Escena y cámara (C++) (`src/scenes/SpaceScene.h`)
+### 8.1b Funciones HLSL compartidas (`src/shaders/Common.hlsli`)
+
+```hlsl
+// Helpers shared by every scene shader. Include it after the scene declares:
+//   g_cb     (with cameraPosition.xyz + tan(fov/2) in .w, cameraForward, cameraRight, cameraUp)
+//   g_scene  (the TLAS) and struct ShadowPayload { float visibility; }
+// Shadow rays use hit group 0 with stride 1 and miss shader 1 (ShadowMiss sets visibility = 1).
+
+// Primary ray direction through the centre of pixel idx; ndc is in [-1, 1] with +y up.
+float3 CameraRayDirection(uint2 idx, uint2 dim, out float2 ndc)
+{
+    ndc = ((float2(idx) + 0.5f) / float2(dim)) * 2.0f - 1.0f;
+    ndc.y = -ndc.y;
+    float aspect = float(dim.x) / float(dim.y);
+    float tanH = g_cb.cameraPosition.w;
+    return normalize(g_cb.cameraForward.xyz
+                   + ndc.x * aspect * tanH * g_cb.cameraRight.xyz
+                   + ndc.y * tanH * g_cb.cameraUp.xyz);
+}
+
+// Any-hit visibility test: returns 1 if nothing is hit before maxT, otherwise `occluded`.
+float TraceVisibility(float3 origin, float3 dir, float maxT, float occluded)
+{
+    RayDesc ray;
+    ray.Origin    = origin;
+    ray.Direction = dir;
+    ray.TMin      = 0.001f;
+    ray.TMax      = maxT;
+    ShadowPayload p;
+    p.visibility = occluded;
+    TraceRay(g_scene,
+             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+             0xFF, 0, 1, 1, ray, p);
+    return p.visibility;
+}
+
+// Exact intersection with the unit sphere in object space (for procedural AABB geometry).
+// Returns the nearest t inside [RayTMin, RayTCurrent] and the object-space normal there.
+bool UnitSphereHit(out float t, out float3 normal)
+{
+    t = 0.0f;
+    normal = float3(0.0f, 1.0f, 0.0f);
+    float3 o = ObjectRayOrigin();
+    float3 d = ObjectRayDirection();
+    float a = dot(d, d);
+    float b = dot(o, d);
+    float c = dot(o, o) - 1.0f;
+    float disc = b * b - a * c;
+    if (disc < 0.0f) return false;
+
+    float sq = sqrt(disc);
+    float t0 = (-b - sq) / a;
+    float t1 = (-b + sq) / a;
+    if (t0 >= RayTMin() && t0 <= RayTCurrent())      t = t0;
+    else if (t1 >= RayTMin() && t1 <= RayTCurrent()) t = t1;
+    else return false;
+    normal = normalize(o + t * d);
+    return true;
+}
+```
+
+### 8.2 Escena y cámara (C++) (`src/scenes/SpaceScene.hpp`)
 
 ```cpp
 #pragma once
@@ -831,10 +862,10 @@ void SatelliteClosestHit(inout RayPayload payload, in SatAttributes attr)
 #include <mutex>
 #include <thread>
 #include <shlobj.h>
-#include "Scene.h"
-#include "space/Astro.h"
-#include "space/Http.h"
-#include "space/Image.h"
+#include "Scene.hpp"
+#include "space/Astro.hpp"
+#include "space/Http.hpp"
+#include "space/Image.hpp"
 #include "Space.hlsl.h"   // generated by dxc: g_pSpace[]
 
 class SpaceScene : public Scene
@@ -1364,7 +1395,7 @@ private:
 };
 ```
 
-### 8.3 Astronomía y mecánica orbital (C++) (`src/space/Astro.h`)
+### 8.3 Astronomía y mecánica orbital (C++) (`src/space/Astro.hpp`)
 
 ```cpp
 #pragma once
@@ -1545,7 +1576,7 @@ inline bool ParseTle(const std::string& text, Orbit& out)
 } // namespace astro
 ```
 
-### 8.4 Descargas HTTP con ETag (C++) (`src/space/Http.h`)
+### 8.4 Descargas HTTP con ETag (C++) (`src/space/Http.hpp`)
 
 ```cpp
 #pragma once
@@ -1668,7 +1699,7 @@ inline Result Download(const std::wstring& url, const std::wstring& outPath, con
 } // namespace http
 ```
 
-### 8.5 Decodificación de imágenes y mipmaps (C++) (`src/space/Image.h`)
+### 8.5 Decodificación de imágenes y mipmaps (C++) (`src/space/Image.hpp`)
 
 ```cpp
 #pragma once
@@ -1678,7 +1709,7 @@ inline Result Download(const std::wstring& url, const std::wstring& outPath, con
 #include <wrl/client.h>
 #include <string>
 #include <vector>
-#include "scenes/Scene.h"
+#include "scenes/Scene.hpp"
 
 namespace image
 {
@@ -1761,7 +1792,7 @@ inline TextureUpload MakeMips(UINT slot, DXGI_FORMAT format, UINT bpp, UINT widt
 } // namespace image
 ```
 
-### 8.6 Interfaz de escena (C++) (`src/scenes/Scene.h`)
+### 8.6 Interfaz de escena (C++) (`src/scenes/Scene.hpp`)
 
 ```cpp
 #pragma once
@@ -1877,10 +1908,10 @@ inline CameraConstants MakeCamera(DirectX::FXMVECTOR eye, DirectX::FXMVECTOR tar
 ### 8.7 Pruebas de escala física (C++) (`tests/astro_test.cpp`)
 
 ```cpp
-// Sanity checks for src/space/Astro.h (built and run on Linux inside the toolchain container):
+// Sanity checks for src/space/Astro.hpp (built and run on Linux inside the toolchain container):
 //   clang++-18 -std=c++17 -O2 -Isrc tests/astro_test.cpp -o /tmp/astro_test && /tmp/astro_test
 #include <cstdio>
-#include "space/Astro.h"
+#include "space/Astro.hpp"
 
 using namespace astro;
 

@@ -22,8 +22,8 @@
 #include <string>
 #include <vector>
 
-#include "scenes/MarbleScene.h"
-#include "scenes/SpaceScene.h"
+#include "scenes/MarbleScene.hpp"
+#include "scenes/SpaceScene.hpp"
 
 using Microsoft::WRL::ComPtr;
 

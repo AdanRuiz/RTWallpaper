@@ -65,6 +65,8 @@ SamplerState                        g_linear : register(s0);
 RWTexture2D<float4>                 g_output : register(u0);
 ConstantBuffer<SceneConstantBuffer> g_cb     : register(b0);
 
+#include "Common.hlsli"
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -342,17 +344,7 @@ float3 TraceRadiance(float3 origin, float3 dir, uint depth)
 
 float TraceShadow(float3 origin, float3 dir)
 {
-    RayDesc ray;
-    ray.Origin    = origin;
-    ray.Direction = dir;
-    ray.TMin      = 0.001f;
-    ray.TMax      = T_MAX;
-    ShadowPayload p;
-    p.visibility = 0.0f;
-    TraceRay(g_scene,
-             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-             0xFF, 0, 1, 1, ray, p);
-    return p.visibility;
+    return TraceVisibility(origin, dir, T_MAX, 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,13 +356,8 @@ void RayGen()
     uint2 idx = DispatchRaysIndex().xy;
     uint2 dim = DispatchRaysDimensions().xy;
 
-    float2 ndc = ((float2(idx) + 0.5f) / float2(dim)) * 2.0f - 1.0f;
-    ndc.y = -ndc.y;
-    float aspect = float(dim.x) / float(dim.y);
-    float tanH = g_cb.cameraPosition.w;
-    float3 dir = normalize(g_cb.cameraForward.xyz
-                         + ndc.x * aspect * tanH * g_cb.cameraRight.xyz
-                         + ndc.y * tanH * g_cb.cameraUp.xyz);
+    float2 ndc;
+    float3 dir = CameraRayDirection(idx, dim, ndc);
 
     float3 col = TraceRadiance(g_cb.cameraPosition.xyz, dir, 0);
 
@@ -413,27 +400,10 @@ void ShadowMiss(inout ShadowPayload payload)
 [shader("intersection")]
 void SphereIntersection()
 {
-    float3 o = ObjectRayOrigin();
-    float3 d = ObjectRayDirection();
-    float a = dot(d, d);
-    float b = dot(o, d);
-    float c = dot(o, o) - 1.0f;
-    float disc = b * b - a * c;
-    if (disc < 0.0f) return;
-    float sq = sqrt(disc);
-    float t0 = (-b - sq) / a;
-    float t1 = (-b + sq) / a;
     EarthAttributes attr;
-    if (t0 >= RayTMin() && t0 <= RayTCurrent())
-    {
-        attr.normal = normalize(o + t0 * d);
-        ReportHit(t0, 0, attr);
-    }
-    else if (t1 >= RayTMin() && t1 <= RayTCurrent())
-    {
-        attr.normal = normalize(o + t1 * d);
-        ReportHit(t1, 0, attr);
-    }
+    float t;
+    if (UnitSphereHit(t, attr.normal))
+        ReportHit(t, 0, attr);
 }
 
 float CloudOpacity(float a)

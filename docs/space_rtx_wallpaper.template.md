@@ -24,7 +24,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 
 ## 2. Escala física (verificada)
 
-`tests/astro_test.cpp` comprueba estos valores contra el código de propagación (`src/space/Astro.h`):
+`tests/astro_test.cpp` comprueba estos valores contra el código de propagación (`src/space/Astro.hpp`):
 
 | Magnitud | Valor calculado | Referencia |
 |---|---|---|
