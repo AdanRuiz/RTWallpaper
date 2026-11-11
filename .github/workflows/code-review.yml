@@ -11,7 +11,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # feature/github-action pinned to a commit; update the SHA when the action changes.
-      - uses: AdanRuiz/advanced-code-review@83a9595cd42ea47d4d105167ce62fc7ba222493a   # feature/github-action
+      - uses: AdanRuiz/advanced-code-review@main   # feature/github-action
         with:
           event-start: 2026-10-24T16:30:00-06:00   # opcional
           event-end: 2026-11-05T23:59:00-06:00     # opcional
