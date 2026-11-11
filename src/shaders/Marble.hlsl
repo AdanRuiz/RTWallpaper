@@ -3,9 +3,9 @@
 //   - 3 quartz spheres (exact spheres via intersection shader, Snell refraction,
 //     Fresnel reflection, total internal reflection, Beer absorption)
 //   - 2 animated neon point lights (cobalt blue + warm amber)
-// Compiled with: dxc -T lib_6_3
+// Compiled with: dxc -T lib_6_3  (scene "marble")
 
-#define MAX_DEPTH 5          // must match MAX_DEPTH in main.cpp (pipeline recursion = MAX_DEPTH + 1)
+#define MAX_DEPTH 5          // MarbleScene::MaxRecursion() = MAX_DEPTH + 1
 #define BRANCH_DEPTH 2       // glass spawns both reflection + refraction rays only up to this depth
 
 struct SceneConstantBuffer
