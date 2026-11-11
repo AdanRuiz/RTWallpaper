@@ -626,11 +626,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// True when a game/app covers its whole monitor. QUNS_BUSY is not used: some setups
+// report it permanently, which would keep the wallpaper paused forever.
 static bool FullscreenAppActive()
 {
     QUERY_USER_NOTIFICATION_STATE s;
-    if (FAILED(SHQueryUserNotificationState(&s))) return false;
-    return s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE;
+    if (SUCCEEDED(SHQueryUserNotificationState(&s)) &&
+        (s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE))
+        return true;
+
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_app.trayWnd || !IsWindowVisible(fg) || IsIconic(fg)) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(fg, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;
+
+    RECT wr;
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetWindowRect(fg, &wr) || !GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mi))
+        return false;
+    return wr.left <= mi.rcMonitor.left && wr.top <= mi.rcMonitor.top &&
+           wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
@@ -729,6 +745,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     const double frameTime = 1.0 / fps;
     ULONGLONG lastPauseCheck = 0;
     bool autoPaused = false;
+    UINT64 framesRendered = 0;   // always draw at least one frame so the wallpaper is never blank
 
     while (g_app.running)
     {
@@ -747,7 +764,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
             autoPaused = FullscreenAppActive();
             lastPauseCheck = GetTickCount64();
         }
-        if (g_app.userPaused || autoPaused || IsIconic(g_app.hwnd))
+        if (framesRendered > 0 && (g_app.userPaused || autoPaused || IsIconic(g_app.hwnd)))
         {
             MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
             QueryPerformanceCounter(&last);
@@ -767,6 +784,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         last = now;
         g_app.animator.Update(std::min(dt, 0.1f), g_app.scene);
         g_app.renderer.Render(g_app.scene);
+        framesRendered++;
 
         // Frame cap (Present already waits for vsync; this caps high refresh displays).
         LARGE_INTEGER end;
