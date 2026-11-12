@@ -1,0 +1,125 @@
+# Builds RTWallpaper.exe on every push / pull request (cross-compiled on Linux with the same
+# Docker toolchain as build.ps1: clang-cl + Windows SDK via xwin + DXC) and runs the physics tests.
+# A tag "v*" also publishes a GitHub Release with the zip and a signed build-provenance
+# attestation (verify with: gh attestation verify RTWallpaper-win-x64.zip -R AdanRuiz/RTWallpaper).
+# Runners have no GPU: this compiles and tests, it does not render.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The toolchain image (~GBs: LLVM, MSVC CRT + Windows SDK, DXC) is cached per version of the
+      # setup script. It stays in this repository's private Actions cache: it is never published,
+      # since it contains Microsoft SDK files.
+      - name: Restore toolchain image
+        id: toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+        with:
+          path: ${{ runner.temp }}/toolchain.tar
+          key: toolchain-${{ hashFiles('docker/setup-toolchain.sh') }}
+
+      - name: Build toolchain image (cache miss)
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The token only raises the GitHub API rate limit for the script; it is passed as a
+          # file and is not part of the committed image.
+          printf '%s' "$GH_TOKEN" > "$RUNNER_TEMP/gh_token"
+          docker run --name rtw-setup -e GH_TOKEN_FILE=/run/gh_token \
+            -v "$RUNNER_TEMP/gh_token:/run/gh_token:ro" -v "$PWD/docker:/setup:ro" \
+            ubuntu:24.04 bash /setup/setup-toolchain.sh
+          rm -f "$RUNNER_TEMP/gh_token"
+          docker commit -c 'ENV LD_LIBRARY_PATH=/dxc/lib' -c 'ENV GH_TOKEN_FILE=' -c 'WORKDIR /src' \
+            rtw-setup rtwallpaper-toolchain
+          docker rm rtw-setup
+          docker save rtwallpaper-toolchain -o "$RUNNER_TEMP/toolchain.tar"
+
+      - name: Load toolchain image (cache hit)
+        if: steps.toolchain.outputs.cache-hit == 'true'
+        run: docker load -i "$RUNNER_TEMP/toolchain.tar"
+
+      - name: Compile shaders and RTWallpaper.exe
+        run: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" rtwallpaper-toolchain bash scripts/build.sh
+
+      - name: Physics tests (orbits, Sun distance, GMST)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" rtwallpaper-toolchain \
+            bash -c 'clang++-18 -std=c++17 -O2 -Isrc tests/astro_test.cpp -o /tmp/astro_test && /tmp/astro_test'
+
+      - name: Package
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then version="$REF_NAME"; else version="dev-${GITHUB_SHA::7}"; fi
+          mkdir -p dist/RTWallpaper
+          cp build/RTWallpaper.exe config/RTWallpaper.ini dist/RTWallpaper/
+          sed -e "s/{{VERSION}}/$version/" -e 's/$/\r/' packaging/LEEME.txt > dist/RTWallpaper/LEEME.txt
+          (cd dist && zip -qr RTWallpaper-win-x64.zip RTWallpaper)
+          sha256sum dist/RTWallpaper-win-x64.zip
+          echo "Built $version: $(stat -c %s dist/RTWallpaper/RTWallpaper.exe) bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: RTWallpaper-win-x64
+          path: dist/RTWallpaper-win-x64.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write       # create the release
+      id-token: write       # sign the attestation
+      attestations: write   # store the attestation
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: RTWallpaper-win-x64
+          path: dist
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8   # v4.2.2
+        with:
+          subject-path: dist/RTWallpaper-win-x64.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sum=$(sha256sum dist/RTWallpaper-win-x64.zip | cut -d' ' -f1)
+          notes="Compilado por GitHub Actions desde \`$TAG\` ($GITHUB_SHA).
+
+          SHA-256: \`$sum\`
+
+          Verifica que el zip viene de este repositorio: \`gh attestation verify RTWallpaper-win-x64.zip -R $GITHUB_REPOSITORY\`
+
+          > **Aviso:** los datos no son precisos (posiciones aproximadas, altura de nubes estimada, efectos artísticos). Es un fondo de pantalla, no un instrumento. Se ofrece tal cual, sin garantía."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/RTWallpaper-win-x64.zip --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/RTWallpaper-win-x64.zip --repo "$GITHUB_REPOSITORY" \
+              --title "RTWallpaper $TAG" --notes "$notes" --generate-notes --verify-tag
+          fi

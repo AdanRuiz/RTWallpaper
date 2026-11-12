@@ -13,6 +13,12 @@ Incluye varias escenas que se eligen en un archivo de configuración.
 
 Requiere Windows 10/11 y una GPU con DirectX Raytracing (NVIDIA RTX, AMD RX 6000+, Intel Arc). El ejecutable no está firmado, así que Windows SmartScreen puede avisar: usa **Más información → Ejecutar de todas formas**.
 
+Desde la v1.2.0 los releases los compila **GitHub Actions** a partir del código publicado, con una atestación firmada de su origen. Para comprobar que el zip viene de este repositorio (con [GitHub CLI](https://cli.github.com)):
+
+```powershell
+gh attestation verify RTWallpaper-win-x64.zip -R AdanRuiz/RTWallpaper
+```
+
 > [!WARNING]
 > **Los datos no son precisos.** RTWallpaper es un fondo de pantalla: busca verse real, no medir nada. No lo uses para navegación, investigación, operaciones, docencia que requiera exactitud ni ninguna decisión importante. En concreto:
 >
@@ -56,6 +62,20 @@ Al construirla aceptas la licencia de Microsoft del SDK/CRT. Después compila:
 
 1. `src/shaders/*.hlsl` → DXIL (`lib_6_3`, firmado con `libdxil.so`) embebido como header.
 2. `src/main.cpp` → `build/RTWallpaper.exe` (x64, CRT estático, sin dependencias).
+
+### En GitHub Actions
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) usa la misma cadena de herramientas en un runner Ubuntu:
+
+* **En cada push y pull request:** compila los shaders y el `.exe`, corre las pruebas de física (`tests/astro_test.cpp`) y deja el zip como artefacto de la ejecución (pestaña **Actions**). La imagen de herramientas se guarda en la caché privada de Actions del repositorio; nunca se publica, porque contiene archivos del SDK de Microsoft.
+* **Al subir una etiqueta `v*`:** además publica el release con el zip y una atestación firmada de su origen.
+
+```powershell
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+Los runners no tienen GPU: la Action compila y prueba, pero no renderiza. El aspecto visual se sigue revisando a mano.
 
 ## Configuración (`RTWallpaper.ini`)
 

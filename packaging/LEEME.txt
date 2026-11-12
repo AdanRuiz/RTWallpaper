@@ -1,0 +1,35 @@
+RTWallpaper {{VERSION}} - fondos de pantalla con ray tracing en tiempo real (DirectX Raytracing)
+
+Requisitos: Windows 10/11 y una GPU con DXR (NVIDIA RTX, AMD RX 6000+, Intel Arc).
+
+Uso:
+  RTWallpaper.exe                 en una ventana (Esc sale, Tab cambia de escena)
+  RTWallpaper.exe --scene space   en una ventana, con la escena indicada
+  RTWallpaper.exe --wallpaper     como fondo de escritorio (icono en la bandeja: escenas, pausar, salir)
+  RTWallpaper.exe --stop          detiene el fondo
+
+Configuracion: RTWallpaper.ini (junto al .exe). Los cambios se aplican al guardar.
+La escena "space" descarga la primera vez ~30 MB (texturas NASA, nubes, orbitas) en
+%LOCALAPPDATA%\RTWallpaper\cache.
+
+Novedades de la v1.1.0 (escena "space"):
+  - Nubes 2.5D (Clouds=layered): altura, relieve, sombras largas, cimas iluminadas tras el
+    ocaso y cimas de coliflor en las tormentas. Clouds=flat vuelve al aspecto anterior.
+  - Destello de lente, amanecer en el limbo, crepusculo suave y reflejo del Sol en el oceano.
+
+Modo desarrollador (DevMode=1 en [Space]):
+  Camara de vista general para revisar todo el planeta. La Tierra da una vuelta cada
+  DevSpinSeconds segundos (0 = ritmo real). En modo ventana:
+    clic derecho + arrastrar   gira alrededor del planeta
+    rueda o pellizco           zoom (500 km a 60 000 km)
+  La vista se guarda en devcamera.ini (borralo para volver a la vista inicial).
+
+AVISO: los datos no son precisos. Es un fondo de pantalla, no un instrumento: posiciones del
+Sol y de los satelites aproximadas, altura de las nubes estimada, texturas de referencia y
+efectos artisticos. No lo uses para nada que requiera exactitud. Se ofrece tal cual, sin garantia.
+
+El ejecutable no esta firmado: Windows SmartScreen puede avisar; usa "Mas informacion" -> "Ejecutar de todas formas".
+
+Codigo fuente: https://github.com/AdanRuiz/RTWallpaper
+Codigo generado por Claude (Anthropic); revisado e iterado por Adan Ruiz.
+Terceros: FastNoiseLite (MIT), texturas NASA GIBS, nubes clouds.matteason.co.uk, TLE Celestrak.

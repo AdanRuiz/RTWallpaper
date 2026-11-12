@@ -12,8 +12,14 @@ rm -rf /var/lib/apt/lists/*
 ln -sf /usr/lib/llvm-18/bin/clang /usr/local/bin/clang-cl
 ln -sf /usr/bin/lld-link-18 /usr/local/bin/lld-link
 
+# Optional GitHub token (CI): read from a mounted file so it is never stored in the image.
+auth=()
+if [ -n "${GH_TOKEN_FILE:-}" ] && [ -s "$GH_TOKEN_FILE" ]; then
+  auth=(-H "Authorization: Bearer $(cat "$GH_TOKEN_FILE")")
+fi
+
 # xwin
-url=$(curl -sSL https://api.github.com/repos/Jake-Shadle/xwin/releases/latest \
+url=$(curl -sSL "${auth[@]}" https://api.github.com/repos/Jake-Shadle/xwin/releases/latest \
       | jq -r '.assets[] | select(.name | test("x86_64-unknown-linux-musl.tar.gz$")) | .browser_download_url')
 curl -sSL "$url" | tar xz -C /tmp
 mv /tmp/xwin-*/xwin /usr/local/bin/xwin
@@ -21,7 +27,7 @@ xwin --accept-license --cache-dir /tmp/xwin-cache splat --output /xwin
 rm -rf /tmp/xwin-cache /tmp/xwin-*
 
 # DXC
-url=$(curl -sSL https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/latest \
+url=$(curl -sSL "${auth[@]}" https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/latest \
       | jq -r '.assets[] | select(.name | test("linux.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)
 mkdir -p /dxc
 curl -sSL "$url" | tar xz -C /dxc
