@@ -5,13 +5,23 @@ Incluye varias escenas que se eligen en un archivo de configuración.
 
 ## Descargar
 
-**[⬇ RTWallpaper-v1.0.0-win-x64.zip](https://github.com/AdanRuiz/RTWallpaper/releases/latest/download/RTWallpaper-v1.0.0-win-x64.zip)** (≈200 KB): el `.exe` listo para usar, sin dependencias, más `RTWallpaper.ini` y `LEEME.txt`. También está en la página de [Releases](https://github.com/AdanRuiz/RTWallpaper/releases).
+**[⬇ RTWallpaper-win-x64.zip](https://github.com/AdanRuiz/RTWallpaper/releases/latest/download/RTWallpaper-win-x64.zip)** (≈210 KB, última versión): el `.exe` listo para usar, sin dependencias, más `RTWallpaper.ini` y `LEEME.txt`. También está en la página de [Releases](https://github.com/AdanRuiz/RTWallpaper/releases).
 
 1. Descomprime el zip en cualquier carpeta.
 2. Ejecuta `RTWallpaper.exe --wallpaper` para ponerlo de fondo, o `RTWallpaper.exe` para verlo en una ventana.
 3. Elige la escena (`marble` o `space`) en `RTWallpaper.ini` o desde el icono de la bandeja.
 
 Requiere Windows 10/11 y una GPU con DirectX Raytracing (NVIDIA RTX, AMD RX 6000+, Intel Arc). El ejecutable no está firmado, así que Windows SmartScreen puede avisar: usa **Más información → Ejecutar de todas formas**.
+
+> [!WARNING]
+> **Los datos no son precisos.** RTWallpaper es un fondo de pantalla: busca verse real, no medir nada. No lo uses para navegación, investigación, operaciones, docencia que requiera exactitud ni ninguna decisión importante. En concreto:
+>
+> * **Posiciones aproximadas:** el Sol usa una efeméride de baja precisión; la ISS y el Hubble se propagan con Kepler + J2 (no SGP4), así que su posición se desvía varios km por día desde la época del TLE, y más si no hay conexión. La hora sale del reloj de tu PC.
+> * **Nubes y tiempo atmosférico:** el mapa de nubes es un compuesto de terceros que se actualiza cada hora (puede tener horas de retraso); la altura de las nubes es una **estimación visual** a partir de su opacidad, no una medición, y las cimas de coliflor son ruido procedural.
+> * **Superficie:** las texturas de la NASA son mosaicos de referencia, no imágenes del día; el viento y las manchas del océano que se ven en el reflejo del Sol son inventados.
+> * **Luz y atmósfera:** modelos simplificados (dispersión simple, sin refracción) con ajustes artísticos (destello de lente, brillo del limbo, exposición).
+>
+> Se ofrece tal cual, sin garantía de ningún tipo.
 
 ## Capturas
 
@@ -103,14 +113,30 @@ Como en el documento original: en Lively, **Add Wallpaper → Browse** y elige `
 
 ### Modo desarrollador (`DevMode=1`)
 
-Cámara de vista general para revisar el planeta entero, con las nubes de día y de noche. La Tierra da una vuelta cada `DevSpinSeconds` segundos.
+Una cámara de vista general para **revisar el planeta entero**: las nubes de día y de noche, el terminador, los amaneceres detrás del limbo o el reflejo del Sol en el océano, sin esperar horas a que la cámara normal pase por ahí.
 
-En **modo ventana** (`RTWallpaper.exe --scene space`):
+**Activarlo:** en `RTWallpaper.ini`, sección `[Space]`:
 
-* **clic derecho + arrastrar:** gira alrededor del planeta;
-* **rueda del ratón o pellizco del touchpad:** zoom, de 500 km a 60 000 km de altura.
+```ini
+DevMode=1            ; cámara de vista general (0 = cámara normal)
+DevSpinSeconds=90    ; la Tierra da una vuelta cada 90 s (0 = gira a su ritmo real)
+```
 
-La vista (ángulos, distancia y giro de la Tierra) se guarda en `devcamera.ini`, junto a `RTWallpaper.ini`, y se recupera en el siguiente arranque. Como fondo de pantalla, la cámara no responde al ratón: usa la última vista guardada.
+Los cambios se aplican al guardar el archivo, sin reiniciar. Luego abre la escena en una ventana: `RTWallpaper.exe --scene space`.
+
+**Controles** (solo en modo ventana):
+
+| Acción | Efecto |
+|---|---|
+| **Clic derecho + arrastrar** | gira la cámara alrededor del planeta (más despacio cuanto más cerca) |
+| **Rueda del ratón** o **pellizco en el touchpad** | zoom, de 500 km a 60 000 km de altura |
+| `Tab` / `Esc` | siguiente escena / salir |
+
+La cámara parte de un lado del planeta con el terminador al centro (mitad día, mitad noche). Para ver un amanecer detrás del limbo, gira hasta poner el Sol detrás de la Tierra y acércate al borde.
+
+**La vista se guarda:** los ángulos, la distancia y el giro de la Tierra se guardan en `devcamera.ini`, junto a `RTWallpaper.ini`, y el siguiente arranque continúa donde lo dejaste. Para volver a la vista inicial, borra `devcamera.ini`.
+
+**Como fondo de pantalla** el modo desarrollador también funciona (con el giro rápido), pero la cámara no responde al ratón: la ventana del fondo está detrás de los iconos del escritorio y no recibe eventos. Usa la última vista guardada. Para volver al fondo normal, pon `DevMode=0`.
 
 ## Estructura
 

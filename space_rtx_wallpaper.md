@@ -681,12 +681,12 @@ float EarthSunVisibility(float3 n, float3 L, float h)
 // z = h0 + s*tanE + s^2 / 2RE); a cloud there whose top is above z blocks the Sun.
 // Sampling by height level instead of by distance covers both short (high Sun) and
 // hundreds-of-km (grazing Sun) shadows with the same 8 samples.
-float CloudShadowLayered(float3 n, float3 Le, float h0, float lod)
+float CloudShadowLayered(float3 n, float3 Le, float h0, float lod, float strength)
 {
     float sinE = dot(n, Le);
     float3 t = Le - n * sinE;
     float tl = length(t);
-    if (tl < 1e-4f) return 1.0f - 0.75f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(n), lod));
+    if (tl < 1e-4f) return 1.0f - strength * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(n), lod));
     t /= tl;
     float tanE = sinE / tl;
     float texel = 2.0f * PI * RE / max(g_cb.textureInfo.z, 1.0f);
@@ -706,9 +706,9 @@ float CloudShadowLayered(float3 n, float3 Le, float h0, float lod)
         float lodK = max(lod, log2(max(s * 0.15f / texel, 1.0f)));         // softer far shadows
         float a = CloudOpacity(g_clouds.SampleLevel(g_linear, uvk, lodK));
         float top = CloudTopKm(uvk, lodK);
-        occ = max(occ, a * smoothstep(z - 0.75f, z + 0.75f, top));
+        occ = max(occ, a * smoothstep(z - 1.5f, z + 1.5f, top));
     }
-    return 1.0f - 0.75f * occ;
+    return 1.0f - strength * occ;
 }
 
 // Normal of the cloud tops from the height-field gradient (world space).
@@ -758,7 +758,7 @@ float BillowTops(float3 q, float footprintKm, float baseKm)
 float CumulusTops(float3 ecef, float footprint, float mask, out float3 tiltEcef)
 {
     tiltEcef = 0;
-    const float BASE_KM = 28.0f;
+    const float BASE_KM = 70.0f;                             // lumps of ~70, 34 and 16 km
     float3 q = ecef * (RE / BASE_KM);
     q += (float3(Noise3(q * 0.31f), Noise3(q * 0.31f + 5.2f), Noise3(q * 0.31f + 9.7f)) - 0.5f) * 1.2f;
     float h0 = BillowTops(q, footprint, BASE_KM);
@@ -773,7 +773,7 @@ float CumulusTops(float3 ecef, float footprint, float mask, out float3 tiltEcef)
     tiltEcef = -((hE - h0) * east + (hN - h0) * north) / d * 0.35f * mask;
 
     float crease = smoothstep(0.0f, 0.30f, h0);              // 0 in the creases, 1 on the lumps
-    return lerp(1.0f, lerp(0.72f, 1.0f, crease), mask);
+    return lerp(1.0f, lerp(0.85f, 1.0f, crease), mask);
 }
 
 // Sun glitter on the sea (Cox & Munk 1954). The surface is a field of facets with Gaussian slopes
@@ -895,7 +895,7 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
             cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uvC, lodC));
             float3 Le = EarthFixed(L);
             if (NdotL > -0.05f)
-                cloudShadow = CloudShadowLayered(ecef, Le, 0.0f, lodC);
+                cloudShadow = CloudShadowLayered(ecef, Le, 0.0f, lodC, 0.75f);
 
             // Cauliflower tops only on tall, dense, large cloud masses: high estimated top, opaque
             // here and over a wide area (8 mips coarser = the mass, not a lone dense pixel).
@@ -920,9 +920,10 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
 
                 // Sunlight on the tops: atmosphere above them, the Earth's limb (tops stay lit
                 // after sunset), shadows from taller clouds, and the relief of the tops.
-                float3 Nc = normalize(CloudTopNormal(Nc0, ecefC, uvC, lodC) + tilt);
-                float sunVis = EarthSunVisibility(Nc0, L, h) * CloudShadowLayered(ecefC, Le, h, lodC);
-                float wrap = saturate((dot(Nc, L) + 0.25f) / 1.25f);
+                float3 NcBase = CloudTopNormal(Nc0, ecefC, uvC, lodC);
+                float3 Nc = normalize(NcBase + tilt);
+                float sunVis = EarthSunVisibility(Nc0, L, h) * CloudShadowLayered(ecefC, Le, h, lodC, 0.45f);   // light leaks through clouds
+                float wrap = saturate((dot(NcBase, L) + 0.25f) / 1.25f);
                 float3 direct = E * SunTransmittance(Nc0 * (RE + h)) * sunVis * wrap;
 
                 // Phase function: matters for thin clouds (silver lining towards the Sun).
@@ -931,7 +932,9 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
                 direct *= lerp(1.0f, phase, exp(-tau * 0.25f));
 
                 // Ambient: blue sky above, light bounced by the ground below.
-                float3 ambient = skylight * 2.0f + albedo * irradiance * 0.3f;
+                // Skylight on clouds, desaturated: shaded parts look grey, not blue.
+                float3 sky2 = skylight * 2.0f;
+                float3 ambient = lerp(dot(sky2, float3(0.2126f, 0.7152f, 0.0722f)), sky2, 0.4f) + albedo * irradiance * 0.3f;
 
                 // City lights glowing through the clouds at night (blurred, warm).
                 float3 glow = 0;
@@ -941,7 +944,13 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
                     float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
                     glow = float3(1.0f, 0.70f, 0.38f) * CityLights(nightBlur) * dark * 0.25f;
                 }
-                cloudLight = R * (direct * crevice + ambient * lerp(1.0f, crevice, 0.6f) + glow);
+                // The lumps keep the colour of the cloud layer: they only scale its brightness
+                // (lit side brighter, side away from the Sun and creases darker), mixed at ~55 %
+                // over the smooth layer so they read as texture of the same cloud.
+                const float LUMP_MIX = 0.55f;
+                float wrapLump = saturate((dot(Nc, L) + 0.25f) / 1.25f);
+                float lump = clamp((wrapLump + 0.2f) / (wrap + 0.2f), 0.65f, 1.3f) * crevice;
+                cloudLight = R * ((direct + ambient) * lerp(1.0f, lump, LUMP_MIX) + glow);
             }
         }
     }
