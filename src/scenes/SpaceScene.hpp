@@ -40,6 +40,10 @@ public:
         double focusLon = -102.5;
         double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
         bool galaxyReal = false;       // true: real galactic orientation; false: "scenic", band kept in view
+        int cloudMode = 1;             // 0 = flat (original), 1 = layered 2.5D (clouds.md phase C1)
+        float cloudRelief = 2.0f;      // exaggeration of the cloud-top relief (layered)
+        bool devMode = false;          // developer: overview camera (orbit/zoom with the mouse in a window)
+        double devSpinSeconds = 90;    // developer: one Earth turn every N s in devMode (0 = no extra spin)
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -55,6 +59,9 @@ private:
         DirectX::XMFLOAT4 textureInfo;    // x = day width, y = night width, z = cloud width
         DirectX::XMFLOAT4 galaxyCenter;   // world direction of the galactic centre
         DirectX::XMFLOAT4 galaxyPole;     // world direction of the galactic north pole
+        DirectX::XMFLOAT4 cloudInfo;      // x = mode (0 flat, 1 layered), y = cloud-top relief exaggeration
+        DirectX::XMFLOAT4 sunVisibility;  // rgb = Sun seen by the camera (limb x atmosphere), w = visible fraction
+        DirectX::XMFLOAT4 sunLimb;        // x = glow of the limb when the Sun is just behind it (0..1)
     };
 
     struct Shared
@@ -67,8 +74,10 @@ private:
 
     static constexpr float FOV_Y = 45.0f;
     static constexpr double REFOLLOW_PERIOD = 1500.0;  // s, camera altitude cycle
+    static constexpr double DEV_ALTITUDE = 13450.0;    // km: the whole disc fills ~85 % of the height
 
     Settings m_settings;
+    std::wstring m_iniPath;
     std::shared_ptr<Shared> m_shared;
     double m_startUnix = 0;
     double m_simSeconds = 0;
@@ -76,15 +85,28 @@ private:
     float m_textureWidth[3] = {};
     float m_lastPitch = 0.0f;
     astro::Vec3 m_galaxyCenter{}, m_galaxyPole{};   // smoothed scenic galaxy frame
+    astro::Vec3 m_sunDir{ 1, 0, 0 };                 // world, towards the Sun (this frame)
+
+    // Developer overview camera (DevMode): orbit angles in a frame tied to the Sun (yaw 0 = looking
+    // at the terminator from the side, pitch = towards the north pole), altitude above the surface.
+    // Targets follow the mouse; the current values ease towards them. Saved in devcamera.ini.
+    bool m_interactive = false;
+    double m_spinOffset = 0;                         // extra Earth rotation (rad) on top of GMST
+    double m_yaw = 0, m_pitch = 20 * astro::DEG, m_alt = DEV_ALTITUDE;
+    double m_yawT = 0, m_pitchT = 20 * astro::DEG, m_altT = DEV_ALTITUDE;
+    double m_saveTimer = 0;
+    bool m_devDirty = false;
 
 public:
-    explicit SpaceScene(const std::wstring& iniPath)
+    explicit SpaceScene(const std::wstring& iniPath) : m_iniPath(iniPath)
     {
         LoadSettings(iniPath);
         FILETIME ft;
         GetSystemTimePreciseAsFileTime(&ft);
         ULARGE_INTEGER u = { { ft.dwLowDateTime, ft.dwHighDateTime } };
         m_startUnix = (double)(u.QuadPart - 116444736000000000ULL) / 1e7 + m_settings.timeOffsetHours * 3600.0;
+
+        if (m_settings.devMode) LoadDevState();
 
         m_shared = std::make_shared<Shared>();
         // Fallback orbits until fresh TLEs arrive (real elements, epoch 2026-11-11).
@@ -97,7 +119,31 @@ public:
         std::thread(Worker, m_shared, m_settings).detach();
     }
 
-    ~SpaceScene() override { m_shared->stop = true; }
+    ~SpaceScene() override
+    {
+        m_shared->stop = true;
+        if (m_interactive && m_settings.devMode) SaveDevState();
+    }
+
+    void SetInteractive(bool interactive) override { m_interactive = interactive; }
+
+    // Right-button drag: the planet follows the mouse. Slower when close to the surface.
+    void OnOrbit(float dx, float dy) override
+    {
+        if (!m_settings.devMode) return;
+        const double perPixel = 0.0035 * std::clamp(m_altT / 15000.0 + 0.08, 0.08, 1.0);
+        m_yawT -= dx * perPixel;
+        m_pitchT = std::clamp(m_pitchT + dy * perPixel, -85.0 * astro::DEG, 85.0 * astro::DEG);
+        m_devDirty = true;
+    }
+
+    // Wheel / touchpad pinch: each step brings the camera 15 % closer to the surface.
+    void OnZoom(float steps) override
+    {
+        if (!m_settings.devMode) return;
+        m_altT = std::clamp(m_altT * std::pow(0.85, (double)steps), 500.0, 60000.0);
+        m_devDirty = true;
+    }
 
     const wchar_t* Name() const override { return L"space"; }
     D3D12_SHADER_BYTECODE Library() const override { return { g_pSpace, sizeof(g_pSpace) }; }
@@ -155,7 +201,13 @@ public:
         }
 
         // --- Earth orientation: world -> ECEF (rotation by GMST around the pole) ---
-        const double theta = astro::Gmst(now);
+        // Developer spin: extra rotation so the whole planet passes by in DevSpinSeconds.
+        if (m_settings.devMode && m_settings.devSpinSeconds > 0)
+        {
+            m_spinOffset = std::fmod(m_spinOffset + 2 * astro::PI * dt / m_settings.devSpinSeconds, 2 * astro::PI);
+            m_devDirty = true;
+        }
+        const double theta = astro::Gmst(now) + (m_settings.devMode ? m_spinOffset : 0.0);
         const float c = (float)std::cos(theta), s = (float)std::sin(theta);
         cb.earthRow[0] = XMFLOAT4(c, 0, -s, 0);
         cb.earthRow[1] = XMFLOAT4(-s, 0, -c, 0);
@@ -165,6 +217,7 @@ public:
         const Vec3 sunEci = astro::SunPositionEci(now);
         const double sunDist = sunEci.Length();
         const Vec3 sunDir = astro::EciToWorld(sunEci).Normalized();
+        m_sunDir = sunDir;
         cb.sunDirection = XMFLOAT4((float)sunDir.x, (float)sunDir.y, (float)sunDir.z,
                                    (float)(20.0 * (astro::AU / sunDist) * (astro::AU / sunDist)));
         cb.sunInfo = XMFLOAT4((float)std::asin(astro::SUN_RADIUS / sunDist), (float)sunDist, 0.16f, 0);
@@ -194,6 +247,35 @@ public:
                 { (float)(x.z * k), (float)(y.z * k), (float)(z.z * k), (float)satPos[i].z },
             };
             memcpy(inst.transform, m, sizeof(m));
+        }
+
+        // --- Developer overview: orbit camera around the planet (mouse in window mode) ---
+        if (m_settings.devMode)
+        {
+            const double k = 1.0 - std::exp(-std::max(dt, 0.0f) * 10.0);       // ease towards the targets
+            m_yaw += (m_yawT - m_yaw) * k;
+            m_pitch += (m_pitchT - m_pitch) * k;
+            m_alt += (m_altT - m_alt) * k;
+            if (m_interactive && m_devDirty && (m_saveTimer += dt) > 2.0)
+            {
+                SaveDevState();
+                m_saveTimer = 0;
+                m_devDirty = false;
+            }
+
+            const Vec3 pole{ 0, 1, 0 };                                        // world +Y = Earth's axis
+            Vec3 side = astro::Cross(pole, sunDir);                            // 90 deg from the Sun
+            side = side.Length() < 1e-6 ? Vec3{ 1, 0, 0 } : side.Normalized();
+            const Vec3 night = astro::Cross(pole, side);                       // away from the Sun
+            const Vec3 horiz = side * std::cos(m_yaw) + night * std::sin(m_yaw);
+            const Vec3 camDir = (horiz * std::cos(m_pitch) + pole * std::sin(m_pitch)).Normalized();
+            const Vec3 cam = camDir * (astro::EARTH_RADIUS + m_alt);
+            const Vec3 fwd = (camDir * -1.0).Normalized();
+            const Vec3 up = (pole - fwd * astro::Dot(pole, fwd)).Normalized();
+            cb.camera = MakeCameraDir(XMVectorSet((float)cam.x, (float)cam.y, (float)cam.z, 0),
+                                      XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
+                                      XMVectorSet((float)up.x, (float)up.y, (float)up.z, 0));
+            return FinishConstants(cb, cam, fwd, up);
         }
 
         // --- Observer ---
@@ -264,13 +346,63 @@ public:
                                   XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
                                   XMVectorSet((float)camDir.x, (float)camDir.y, (float)camDir.z, 0));
 
-        UpdateGalaxyFrame(fwd, camDir, cb);
-        cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
-        cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
-        return sizeof(Constants);
+        return FinishConstants(cb, cam, fwd, camDir);
     }
 
 private:
+    UINT FinishConstants(Constants& cb, const astro::Vec3& cam, const astro::Vec3& fwd, const astro::Vec3& upHint)
+    {
+        using DirectX::XMFLOAT4;
+        UpdateGalaxyFrame(fwd, upHint, cb);
+        SunVisibility(cam, cb);
+        cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
+        cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
+        cb.cloudInfo = XMFLOAT4((float)m_settings.cloudMode, m_settings.cloudRelief, 0, 0);
+        return sizeof(Constants);
+    }
+
+    // The Sun as the camera sees it, once per frame (the shader no longer traces a shadow ray per
+    // pixel for the glare): the fraction of the solar disc above the Earth's limb, and the colour
+    // of its light after grazing the atmosphere (orange-red when it rises or sets behind the limb).
+    void SunVisibility(const astro::Vec3& cam, Constants& cb) const
+    {
+        using astro::Vec3;
+        const double R = astro::EARTH_RADIUS;
+        const double d = cam.Length();
+        const Vec3 toEarth = cam * (-1.0 / d);
+        const double cosT = std::clamp(astro::Dot(m_sunDir, toEarth), -1.0, 1.0);
+        const double theta = std::acos(cosT);                       // Sun <-> Earth centre, seen from the camera
+        const double rhoE = std::asin(std::min(1.0, (R + 5.0) / d)); // the lowest ~5 km of air is opaque edge-on
+        const double rhoS = std::max((double)cb.sunInfo.x, 1e-6);
+        // Covered part of the disc: circular segment behind a (locally straight) limb.
+        const double x = std::clamp((theta - rhoE) / rhoS, -1.0, 1.0);
+        const double vis = 1.0 - (std::acos(x) - x * std::sqrt(1.0 - x * x)) / astro::PI;
+
+        // Grazing height of the camera -> Sun ray and the optical depth of that tangent path
+        // through an exponential atmosphere: tau = beta * H * sqrt(2 pi (R + h) / H) * exp(-h / H).
+        const double along = cosT * d;                               // distance to the closest approach
+        const double hT = std::max((along > 0 ? (cam + m_sunDir * along).Length() : d) - R, 0.0);
+        auto tau = [&](double beta, double H) {
+            return beta * H * std::sqrt(2.0 * astro::PI * (R + hT) / H) * std::exp(-hT / H);
+        };
+        const double mie = tau(4.40e-3, 1.2);
+        const double tr = std::exp(-(tau(5.802e-3, 8.0) + mie));
+        const double tg = std::exp(-(tau(13.558e-3, 8.0) + mie));
+        const double tb = std::exp(-(tau(33.1e-3, 8.0) + mie));
+        // Glare and flare follow the visible fraction perceptually (a sliver of Sun is still a
+        // blinding point: a camera saturates long before the disc is whole), and the reddening
+        // is softened (sqrt) so a rising Sun stays a vivid orange star instead of fading out.
+        const double seen = std::pow(vis, 0.35);
+        cb.sunVisibility = DirectX::XMFLOAT4((float)(std::sqrt(tr) * seen), (float)(std::sqrt(tg) * seen),
+                                             (float)(std::sqrt(tb) * seen), (float)vis);
+
+        // Sunrise / sunset behind the limb: for the last ~2 degrees before the Sun appears (and
+        // while it is partly covered) the air at the limb scatters a blaze of forward light.
+        const double behind = std::max(rhoE - theta, 0.0);          // how far the Sun centre is behind the limb
+        const double glow = (1.0 - vis) * std::exp(-behind / (0.8 * astro::DEG));
+        cb.sunLimb = DirectX::XMFLOAT4((float)glow, 0, 0, 0);
+    }
+
     static constexpr double DAY_LIMIT = 78.0 * astro::DEG;   // max observer distance from the subsolar point
 
     // Galactic frame for the sky. Real: galactic north pole RA 192.86 Dec +27.13, centre RA 266.40
@@ -369,6 +501,14 @@ private:
         m_settings.focusMinutes = _wtof(buf);
         GetPrivateProfileStringW(sec, L"Galaxy", L"scenic", buf, 64, ini.c_str());
         m_settings.galaxyReal = _wcsicmp(buf, L"real") == 0;
+        // Clouds: flat | layered | volumetric (volumetric = layered until phase C3 exists).
+        GetPrivateProfileStringW(sec, L"Clouds", L"layered", buf, 64, ini.c_str());
+        m_settings.cloudMode = _wcsicmp(buf, L"flat") == 0 ? 0 : 1;
+        GetPrivateProfileStringW(sec, L"CloudRelief", L"2", buf, 64, ini.c_str());
+        m_settings.cloudRelief = std::clamp((float)_wtof(buf), 0.0f, 10.0f);
+        m_settings.devMode = GetPrivateProfileIntW(sec, L"DevMode", 0, ini.c_str()) != 0;
+        GetPrivateProfileStringW(sec, L"DevSpinSeconds", L"90", buf, 64, ini.c_str());
+        m_settings.devSpinSeconds = std::clamp(_wtof(buf), 0.0, 86400.0);
     }
 
     // -----------------------------------------------------------------------
@@ -385,6 +525,44 @@ private:
         dir += L"\\cache";
         CreateDirectoryW(dir.c_str(), nullptr);
         return dir + L"\\";
+    }
+
+    // Developer camera state: devcamera.ini next to RTWallpaper.ini (a separate file, so saving it
+    // never reloads the scene; each copy of the app keeps its own view).
+    // EarthAngle is the absolute rotation (GMST + spin): the planet reappears as it was left.
+    std::wstring DevStatePath() const
+    {
+        return m_iniPath.substr(0, m_iniPath.find_last_of(L"\\/") + 1) + L"devcamera.ini";
+    }
+
+    void LoadDevState()
+    {
+        const std::wstring path = DevStatePath();
+        if (!FileExists(path)) return;
+        wchar_t buf[64];
+        auto get = [&](const wchar_t* key, double def) {
+            GetPrivateProfileStringW(L"DevCamera", key, L"", buf, 64, path.c_str());
+            return buf[0] ? _wtof(buf) : def;
+        };
+        m_yaw = m_yawT = get(L"Yaw", 0.0);
+        m_pitch = m_pitchT = std::clamp(get(L"Pitch", 20 * astro::DEG), -85.0 * astro::DEG, 85.0 * astro::DEG);
+        m_alt = m_altT = std::clamp(get(L"Altitude", DEV_ALTITUDE), 500.0, 60000.0);
+        const double angle = get(L"EarthAngle", 1e9);
+        if (angle < 1e8) m_spinOffset = std::fmod(angle - astro::Gmst(m_startUnix), 2 * astro::PI);
+    }
+
+    void SaveDevState() const
+    {
+        const std::wstring path = DevStatePath();
+        auto put = [&](const wchar_t* key, double v) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"%.6f", v);
+            WritePrivateProfileStringW(L"DevCamera", key, buf, path.c_str());
+        };
+        put(L"Yaw", m_yawT);
+        put(L"Pitch", m_pitchT);
+        put(L"Altitude", m_altT);
+        put(L"EarthAngle", std::fmod(astro::Gmst(m_startUnix + m_simSeconds) + m_spinOffset, 2 * astro::PI));
     }
 
     static bool FileExists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }

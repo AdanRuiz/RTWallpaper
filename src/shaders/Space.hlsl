@@ -33,6 +33,9 @@ struct SceneConstantBuffer
     float4 textureInfo;      // x = day width, y = night width, z = cloud width
     float4 galaxyCenter;     // world direction of the galactic centre
     float4 galaxyPole;       // world direction of the galactic north pole
+    float4 cloudInfo;        // x = mode (0 flat, 1 layered), y = cloud-top relief exaggeration
+    float4 sunVisibility;    // rgb = Sun seen by the camera (limb coverage x atmosphere), w = fraction of the disc
+    float4 sunLimb;          // x = glow of the limb when the Sun is just behind it (0..1)
 };
 
 struct RayPayload
@@ -171,8 +174,11 @@ float3 Atmosphere(float3 o, float3 d, float tMax, out float3 transmittance)
 
     float mu = dot(d, g_cb.sunDirection.xyz);
     float phaseR = 3.0f / (16.0f * PI) * (1.0f + mu * mu);
-    const float g = 0.76f;
-    float phaseM = (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f));
+    // Mie: haze (g = 0.76) plus a narrow forward lobe (g = 0.95) for larger aerosols, so the limb
+    // blazes where the Sun is about to rise behind it.
+    const float g = 0.76f, g2 = 0.95f;
+    float phaseM = 0.8f * (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f))
+                 + 0.2f * (1.0f - g2 * g2) / (4.0f * PI * pow(abs(1.0f + g2 * g2 - 2.0f * g2 * mu), 1.5f));
 
     const int HALF = 6;   // 12 samples per view ray
     float odR = 0.0f, odM = 0.0f;
@@ -301,12 +307,67 @@ float3 Sun(float3 d)
     return float3(1.0f, 0.96f, 0.9f) * smoothstep(cos(r * 1.15f), cos(r * 0.85f), cosA) * 2000.0f;
 }
 
-// Lens glare around the Sun (camera effect), only when the Sun is actually visible.
+// Lens glare around the Sun (camera effect). Evaluated over the whole image: it fades smoothly
+// to zero, with no cut-off circle.
 float3 SunGlare(float3 d)
 {
     float r = g_cb.sunInfo.x;
     float a = acos(clamp(dot(d, g_cb.sunDirection.xyz), -1.0f, 1.0f));
-    return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.5f * exp(-a / (r * 40.0f)));
+    return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.35f * exp(-a / (r * 30.0f)));
+}
+
+// Sunrise behind the limb: the thin shell of air at the limb forward-scatters a warm blaze, an
+// arc along the limb centred where the Sun is about to appear. It lives in the air only: rays
+// that pass high above the limb or hit the ground well inside the disc get none of it (otherwise
+// the dark Earth would look transparent).
+float3 LimbGlow(float3 o, float3 d)
+{
+    float b = dot(o, d);
+    float hc = (b < 0.0f ? sqrt(max(dot(o, o) - b * b, 0.0f)) : length(o)) - RE;   // closest approach altitude
+    float shell = hc >= 0.0f ? exp(-hc / 18.0f) : exp(hc / 5.0f);
+    float r = g_cb.sunInfo.x;
+    float a = acos(clamp(dot(d, g_cb.sunDirection.xyz), -1.0f, 1.0f));
+    return float3(1.0f, 0.72f, 0.45f) * shell * (40.0f * exp(-a / (r * 6.0f)) + 2.0f * exp(-a / (r * 40.0f)));
+}
+
+// Lens flare of a multi-element camera lens: star-shaped diffraction spikes and a chromatic halo
+// around the Sun, plus coloured ghost reflections on the line from the Sun through the image
+// centre. p and s are aspect-corrected screen coordinates of the pixel and of the Sun.
+float3 LensFlare(float2 p, float2 s, float2 dimSun)
+{
+    float3 col = 0;
+    float2 v = p - s;
+    float dS = length(v);
+
+    // Diffraction spikes (6-blade aperture) and a faint wide star.
+    float ang = atan2(v.y, v.x);
+    float spikes = pow(abs(cos(ang * 3.0f)), 180.0f) + 0.4f * pow(abs(cos(ang * 3.0f + 0.52f)), 400.0f);
+    col += float3(1.0f, 0.95f, 0.85f) * spikes * exp(-dS / 0.10f) * 6.0f;
+
+    // Chromatic halo: a thin ring, red outside, blue inside.
+    const float haloR = 0.42f;
+    col += float3(exp(-pow((dS - haloR * 1.02f) / 0.012f, 2.0f)),
+                  exp(-pow((dS - haloR) / 0.012f, 2.0f)),
+                  exp(-pow((dS - haloR * 0.98f) / 0.012f, 2.0f))) * 0.18f;
+
+    // Ghosts: position along the Sun -> centre axis (1 = Sun, 0 = centre, < 0 = beyond it).
+    const float  kPos[7] = { 0.55f, 0.28f, -0.18f, -0.42f, -0.72f, -1.0f, -1.35f };
+    const float  kRad[7] = { 0.060f, 0.025f, 0.110f, 0.045f, 0.200f, 0.085f, 0.032f };
+    const float3 kCol[7] = { float3(0.35f, 0.85f, 0.55f), float3(1.0f, 0.65f, 0.30f), float3(0.55f, 0.35f, 1.0f),
+                             float3(0.25f, 0.75f, 1.0f), float3(1.0f, 0.40f, 0.65f), float3(0.60f, 1.0f, 0.45f),
+                             float3(1.0f, 0.85f, 0.55f) };
+    [unroll]
+    for (int i = 0; i < 7; i++)
+    {
+        float d = length(p - s * kPos[i]);
+        float disc = smoothstep(kRad[i], kRad[i] * 0.75f, d);              // soft-edged aperture image
+        float rim = exp(-pow((d - kRad[i]) / (kRad[i] * 0.08f), 2.0f));     // brighter rim
+        float ring = (i == 4) ? 1.0f : 0.0f;                                // one large ring-shaped ghost
+        col += kCol[i] * lerp(disc * 0.5f + rim * 0.35f, rim, ring) * 0.22f;
+    }
+    // Flares fade as the Sun leaves the frame.
+    float onScreen = 1.0f - smoothstep(1.0f, 1.8f, max(abs(dimSun.x), abs(dimSun.y)));
+    return col * onScreen;
 }
 
 // World direction -> galactic coordinates. The frame comes from the constant buffer: either the
@@ -361,12 +422,24 @@ void RayGen()
 
     float3 col = TraceRadiance(g_cb.cameraPosition.xyz, dir, 0);
 
-    // Glare: a shadow ray towards the Sun (hidden behind the Earth => no glare), only for pixels
-    // within ~35 degrees of the Sun where the glare is not negligible.
-    if (dot(dir, g_cb.sunDirection.xyz) > 0.82f)
+    // Glare and lens flare, scaled by how much of the Sun the camera sees: the fraction of the
+    // disc above the Earth's limb, reddened by the air it grazes (computed once per frame on the
+    // CPU, see SpaceScene::SunVisibility). Hidden Sun => no glare, no flare.
+    float3 sunSeen = g_cb.sunVisibility.rgb;
+    if (g_cb.sunLimb.x > 0.001f)
+        col += LimbGlow(g_cb.cameraPosition.xyz, dir) * g_cb.sunLimb.x;
+    if (g_cb.sunVisibility.w > 0.0f)
     {
-        float sunVisible = TraceShadow(g_cb.cameraPosition.xyz, g_cb.sunDirection.xyz);
-        col += SunGlare(dir) * sunVisible * SunTransmittance(g_cb.cameraPosition.xyz);
+        col += SunGlare(dir) * sunSeen;
+        float3 L = g_cb.sunDirection.xyz;
+        float f = dot(L, g_cb.cameraForward.xyz);
+        if (f > 0.05f)
+        {
+            float aspect = float(dim.x) / float(dim.y);
+            float tanH = g_cb.cameraPosition.w;
+            float2 sunNdc = float2(dot(L, g_cb.cameraRight.xyz) / (f * tanH * aspect), dot(L, g_cb.cameraUp.xyz) / (f * tanH));
+            col += LensFlare(ndc * float2(aspect, 1.0f), sunNdc * float2(aspect, 1.0f), sunNdc) * sunSeen;
+        }
     }
 
     col *= 1.0f - 0.12f * dot(ndc * 0.7f, ndc * 0.7f);
@@ -430,6 +503,191 @@ float3 ProceduralAlbedo(float3 ecef, out float ocean)
     return lerp(c, float3(0.75f, 0.78f, 0.82f), ice);
 }
 
+// ---------------------------------------------------------------------------
+// Layered (2.5D) clouds, clouds.md phase C1: cloud-top height estimated from the opacity map,
+// parallax, relief on the tops, long shadows, tops lit after sunset, two-stream light.
+// ---------------------------------------------------------------------------
+static const float CLOUD_TOP_MAX = 12.0f;   // km
+
+float3 WorldFromEarth(float3 v)
+{
+    return g_cb.earthRow[0].xyz * v.x + g_cb.earthRow[1].xyz * v.y + g_cb.earthRow[2].xyz * v.z;
+}
+
+// Cloud-top height (km) estimated from opacity: thin and medium layers stay at 2-4 km, only the
+// densest cores (thunderstorms) climb to 12 km. Read from a coarser mip so towers get rounded
+// tops and their edges taper down.
+float CloudTopKm(float2 uv, float lod)
+{
+    float a = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lod + 1.5f));
+    float k = smoothstep(0.6f, 1.0f, a);
+    return 2.0f + (CLOUD_TOP_MAX - 2.0f) * k * k;
+}
+
+// First crossing of the view ray with the sphere of radius RE + h (the camera is always above).
+float3 RayAtHeight(float3 o, float3 d, float h, float3 fallback)
+{
+    float r = RE + h;
+    float b = dot(o, d);
+    float disc = b * b - (dot(o, o) - r * r);
+    if (disc < 0.0f) return fallback;
+    float t = -b - sqrt(disc);
+    return t > 0.0f ? o + d * t : fallback;
+}
+
+// Fraction of the solar disc above the Earth's limb seen from height h (km) over the unit
+// normal n: the horizon dips by acos(RE / (RE + h)), so high tops stay lit after sunset.
+// The ramp after it dims grazing light: only tower sides face the Sun at the very end of the day.
+float EarthSunVisibility(float3 n, float3 L, float h)
+{
+    float elev = asin(clamp(dot(n, L), -1.0f, 1.0f));
+    float dip = acos(RE / (RE + h));
+    float above = elev + dip;                                  // Sun altitude over this horizon (rad)
+    return smoothstep(-g_cb.sunInfo.x, g_cb.sunInfo.x, above) * (0.3f + 0.7f * saturate(above / 0.1f));
+}
+
+// Shadow cast by clouds on a point at height h0 (km), n = unit ECEF normal, Le = Sun (ECEF).
+// The sun ray reaches height z at horizontal distance s(z) (Earth curvature included:
+// z = h0 + s*tanE + s^2 / 2RE); a cloud there whose top is above z blocks the Sun.
+// Sampling by height level instead of by distance covers both short (high Sun) and
+// hundreds-of-km (grazing Sun) shadows with the same 8 samples.
+float CloudShadowLayered(float3 n, float3 Le, float h0, float lod)
+{
+    float sinE = dot(n, Le);
+    float3 t = Le - n * sinE;
+    float tl = length(t);
+    if (tl < 1e-4f) return 1.0f - 0.75f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(n), lod));
+    t /= tl;
+    float tanE = sinE / tl;
+    float texel = 2.0f * PI * RE / max(g_cb.textureInfo.z, 1.0f);
+    float occ = 0.0f;
+    [loop]
+    for (int k = 0; k < 8; k++)
+    {
+        float z = lerp(h0 + 0.3f, CLOUD_TOP_MAX + 0.5f, (k + 0.5f) / 8.0f);
+        float dz = z - h0;
+        if (dz <= 0.0f) continue;
+        float q = sqrt(tanE * tanE + 2.0f * dz / RE);
+        float s = tanE > 0.0f ? 2.0f * dz / (tanE + q) : RE * (q - tanE);   // stable both ways
+        if (s > 700.0f) break;
+        float ang = s / RE;
+        float3 m = n * cos(ang) + t * sin(ang);                            // great-circle step
+        float2 uvk = LatLonUV(m);
+        float lodK = max(lod, log2(max(s * 0.15f / texel, 1.0f)));         // softer far shadows
+        float a = CloudOpacity(g_clouds.SampleLevel(g_linear, uvk, lodK));
+        float top = CloudTopKm(uvk, lodK);
+        occ = max(occ, a * smoothstep(z - 0.75f, z + 0.75f, top));
+    }
+    return 1.0f - 0.75f * occ;
+}
+
+// Normal of the cloud tops from the height-field gradient (world space).
+float3 CloudTopNormal(float3 N, float3 ecef, float2 uv, float lod)
+{
+    float3 east = cross(WorldFromEarth(float3(0.0f, 0.0f, 1.0f)), N);
+    float el = length(east);
+    if (el < 1e-3f) return N;                                              // poles
+    east /= el;
+    float3 north = cross(N, east);
+    // Gradient of a smoother height (1.5 mips coarser than CloudTopKm's own blur): the tops show
+    // towers and fronts, not foam-like bubbles from texel-level noise in the opacity map.
+    float lodN = lod + 1.5f;
+    float w = max(g_cb.textureInfo.z, 1.0f);
+    float stepU = exp2(lodN + 1.5f) / w;                                   // one coarse texel
+    float stepKm = 2.0f * PI * RE * stepU;
+    float coslat = max(sqrt(saturate(1.0f - ecef.z * ecef.z)), 0.05f);
+    float dE = (CloudTopKm(uv + float2(stepU, 0), lodN) - CloudTopKm(uv - float2(stepU, 0), lodN)) / (2.0f * stepKm * coslat);
+    float dN = (CloudTopKm(uv - float2(0, 2.0f * stepU), lodN) - CloudTopKm(uv + float2(0, 2.0f * stepU), lodN)) / (2.0f * stepKm);
+    float k = g_cb.cloudInfo.y;
+    return normalize(N - k * (dE * east + dN * north));
+}
+
+// Billow noise: |2n - 1| of a smooth value noise. Its highs are round lumps and its zeros sharp
+// creases, which is what cauliflower cloud tops look like; summed over octaves the lumps come in
+// very irregular sizes. Octaves whose features get smaller than ~2 pixels fade out (no shimmer).
+float BillowTops(float3 q, float footprintKm, float baseKm)
+{
+    float s = 0.0f, norm = 0.0f, a = 1.0f, km = baseKm;
+    [unroll]
+    for (int i = 0; i < 3; i++)
+    {
+        float w = a * (1.0f - smoothstep(0.35f, 0.8f, footprintKm / km));
+        s += w * abs(Noise3(q) * 2.0f - 1.0f);
+        norm += a;
+        q = q * 2.07f + float3(3.1f, 7.7f, 1.3f);
+        a *= 0.55f;
+        km *= 0.483f;
+    }
+    return s / norm;
+}
+
+// Cauliflower tops of big, tall, dense cloud masses (cumulonimbus, cumulus congestus). mask
+// selects where they grow. Returns a shading factor (darker in the creases) and the lean of the
+// top normal (ECEF) from the gradient of the billow height, so each lump has a lit side and a
+// side in shadow. The domain is warped a little so the lumps do not line up.
+float CumulusTops(float3 ecef, float footprint, float mask, out float3 tiltEcef)
+{
+    tiltEcef = 0;
+    const float BASE_KM = 28.0f;
+    float3 q = ecef * (RE / BASE_KM);
+    q += (float3(Noise3(q * 0.31f), Noise3(q * 0.31f + 5.2f), Noise3(q * 0.31f + 9.7f)) - 0.5f) * 1.2f;
+    float h0 = BillowTops(q, footprint, BASE_KM);
+
+    float3 east = float3(-ecef.y, ecef.x, 0.0f);
+    float el = length(east);
+    east = el > 1e-4f ? east / el : float3(1.0f, 0.0f, 0.0f);
+    float3 north = cross(ecef, east);
+    const float d = 0.12f;                                   // finite-difference step (base cells)
+    float hE = BillowTops(q + east * d, footprint, BASE_KM);
+    float hN = BillowTops(q + north * d, footprint, BASE_KM);
+    tiltEcef = -((hE - h0) * east + (hN - h0) * north) / d * 0.35f * mask;
+
+    float crease = smoothstep(0.0f, 0.30f, h0);              // 0 in the creases, 1 on the lumps
+    return lerp(1.0f, lerp(0.72f, 1.0f, crease), mask);
+}
+
+// Sun glitter on the sea (Cox & Munk 1954). The surface is a field of facets with Gaussian slopes
+// of variance sigma2; the glint is the share of facets tilted to mirror the Sun towards the
+// camera. Returns radiance per unit of solar irradiance (perpendicular to the Sun), in the same
+// units as albedo * E for the land. Elongated at grazing angles by the geometry itself.
+float SunGlitter(float3 N, float3 V, float3 L, float sigma2)
+{
+    float3 H = normalize(L + V);
+    float cosB = saturate(dot(N, H));                        // facet tilt from the mean surface
+    float cosV = max(dot(N, V), 0.03f);
+    float cos2 = max(cosB * cosB, 1e-4f);
+    float p = exp(-(1.0f - cos2) / cos2 / sigma2) / (PI * sigma2);
+    float F = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);   // Fresnel of water
+    return PI * F * p / (4.0f * cosV * cos2 * cos2);
+}
+
+// Wind over the sea, fixed to the ground. What the glint reveals from orbit is not the waves
+// (metres long) but patches of different roughness: regional wind (calm = tight, bright glint;
+// windy = wide, dull) and slicks / wind rows at 5-50 km, here a warped multi-octave pattern.
+// Returns the slope variance (Cox-Munk: 0.003 + 0.00512 * wind m/s).
+float OceanRoughness(float3 ecef, float footprintKm)
+{
+    float3 q = ecef * RE;                                                  // km
+    float wind = lerp(2.5f, 11.0f, Fbm3(q / 420.0f, 3));                   // m/s, weather-scale patches
+    float3 s = q / 40.0f;
+    s += (float3(Noise3(s * 0.4f), Noise3(s * 0.4f + 4.1f), Noise3(s * 0.4f + 8.3f)) - 0.5f) * 2.0f;
+    float slick = Fbm3(s, 4);
+    float detail = 1.0f - smoothstep(6.0f, 20.0f, footprintKm);           // unresolved => average
+    wind *= lerp(1.0f, lerp(0.35f, 1.25f, smoothstep(0.30f, 0.70f, slick)), detail);
+    return 0.003f + 0.00512f * wind;
+}
+
+float PhaseHG(float mu, float g)
+{
+    return (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f));
+}
+
+// Night-side city lights from the Black Marble map (warm lights only).
+float CityLights(float3 night)
+{
+    return saturate((night.r + night.g) * 0.5f - night.b * 0.75f) * 6.0f;
+}
+
 [shader("closesthit")]
 void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
 {
@@ -458,45 +716,125 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
         albedo = ProceduralAlbedo(ecef, ocean);
     }
 
-    // Live clouds (coverage) and their shadows on the ground.
-    float cloud = 0.0f, cloudShadow = 1.0f;
-    if (g_cb.params.w > 0.5f)
-    {
-        float lodC = TextureLod(g_cb.textureInfo.z, N, V);
-        // The live map is infrared-derived: cold ground and thin cirrus read as partly cloudy.
-        // Keep dense clouds opaque and make thin ones translucent.
-        cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lodC));
-        if (NdotL > 0.0f)
-        {
-            float3 Le = EarthFixed(L);
-            float3 tang = Le - ecef * dot(ecef, Le);
-            float3 ns = normalize(ecef + tang * (CLOUD_HEIGHT / RE) / max(NdotL, 0.1f));
-            cloudShadow = 1.0f - 0.65f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(ns), lodC));
-        }
-    }
-
     // Direct sunlight, attenuated by the atmosphere above this point, plus blue skylight.
     float3 Tsun = SunTransmittance(P);
     float3 irradiance = E * Tsun * saturate(NdotL);
-    float3 skylight = E * float3(0.03f, 0.05f, 0.09f) * saturate(NdotL + 0.15f);
+    // Twilight fades exponentially after sunset (it used to be a linear ramp that hit zero at
+    // -8.6 deg, which read as a dark line on the night side): -2 deg ~ 1/3, -6 deg ~ 1/20,
+    // -12 deg ~ 1/400 of the light at sunset. A faint floor (starlight, airglow) keeps the night
+    // side from being pure black.
+    float twilight = NdotL >= 0.0f ? NdotL + 0.15f : 0.15f * exp(NdotL / 0.035f);
+    float3 skylight = E * (float3(0.03f, 0.05f, 0.09f) * twilight + float3(0.0005f, 0.0006f, 0.0009f));
+
+    // Live clouds. cloud = opacity (hides the ground), cloudLight = light reflected by the
+    // clouds (already weighted by their coverage), cloudShadow = shadow on the ground.
+    float cloud = 0.0f, cloudShadow = 1.0f;
+    float3 cloudLight = 0;
+    if (g_cb.params.w > 0.5f)
+    {
+        float lodC = TextureLod(g_cb.textureInfo.z, N, V);
+        if (g_cb.cloudInfo.x < 0.5f)
+        {
+            // Flat: one layer at CLOUD_HEIGHT. The live map is infrared-derived: cold ground and
+            // thin cirrus read as partly cloudy, so dense clouds stay opaque and thin ones translucent.
+            cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lodC));
+            if (NdotL > 0.0f)
+            {
+                float3 Le = EarthFixed(L);
+                float3 tang = Le - ecef * dot(ecef, Le);
+                float3 ns = normalize(ecef + tang * (CLOUD_HEIGHT / RE) / max(NdotL, 0.1f));
+                cloudShadow = 1.0f - 0.65f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(ns), lodC));
+            }
+            cloudLight = (E * SunTransmittance(P + N * CLOUD_HEIGHT) * saturate(NdotL + 0.05f) + skylight * 2.0f) * 0.8f * cloud;
+        }
+        else
+        {
+            // Layered: find where the view ray meets the cloud tops (parallax, 2 iterations).
+            float3 o = WorldRayOrigin();
+            float h = CloudTopKm(uv, lodC);
+            float3 Pc = RayAtHeight(o, D, h, P);
+            float3 ecefC = EarthFixed(normalize(Pc));
+            float2 uvC = LatLonUV(ecefC);
+            h = CloudTopKm(uvC, lodC);
+            Pc = RayAtHeight(o, D, h, P);
+            float3 Nc0 = normalize(Pc);
+            ecefC = EarthFixed(Nc0);
+            uvC = LatLonUV(ecefC);
+            h = CloudTopKm(uvC, lodC);
+
+            cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uvC, lodC));
+            float3 Le = EarthFixed(L);
+            if (NdotL > -0.05f)
+                cloudShadow = CloudShadowLayered(ecef, Le, 0.0f, lodC);
+
+            // Cauliflower tops only on tall, dense, large cloud masses: high estimated top, opaque
+            // here and over a wide area (8 mips coarser = the mass, not a lone dense pixel).
+            float footprint = RayTCurrent() * 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y)
+                            / max(dot(N, V), 0.2f);
+            float mass = CloudOpacity(g_clouds.SampleLevel(g_linear, uvC, lodC + 3.0f));
+            float towers = smoothstep(4.0f, 10.0f, h) * smoothstep(0.6f, 1.0f, mass) * smoothstep(0.5f, 0.95f, cloud);
+            float3 tilt = 0;
+            float crevice = 1.0f;
+            if (towers > 0.0f)
+            {
+                float3 tiltEcef;
+                crevice = CumulusTops(ecefC, footprint, towers, tiltEcef);
+                tilt = WorldFromEarth(tiltEcef);
+            }
+
+            if (cloud > 0.002f)
+            {
+                // Two-stream reflectance of a cloud slab: optical depth from opacity, g = 0.85.
+                float tau = -log(1.0f - 0.98f * cloud) * 8.0f;
+                float R = 0.15f * tau / (1.0f + 0.15f * tau);
+
+                // Sunlight on the tops: atmosphere above them, the Earth's limb (tops stay lit
+                // after sunset), shadows from taller clouds, and the relief of the tops.
+                float3 Nc = normalize(CloudTopNormal(Nc0, ecefC, uvC, lodC) + tilt);
+                float sunVis = EarthSunVisibility(Nc0, L, h) * CloudShadowLayered(ecefC, Le, h, lodC);
+                float wrap = saturate((dot(Nc, L) + 0.25f) / 1.25f);
+                float3 direct = E * SunTransmittance(Nc0 * (RE + h)) * sunVis * wrap;
+
+                // Phase function: matters for thin clouds (silver lining towards the Sun).
+                float mu = dot(L, D);
+                float phase = 4.0f * PI * (0.7f * PhaseHG(mu, 0.8f) + 0.3f * PhaseHG(mu, -0.3f));
+                direct *= lerp(1.0f, phase, exp(-tau * 0.25f));
+
+                // Ambient: blue sky above, light bounced by the ground below.
+                float3 ambient = skylight * 2.0f + albedo * irradiance * 0.3f;
+
+                // City lights glowing through the clouds at night (blurred, warm).
+                float3 glow = 0;
+                if (g_cb.params.z > 0.5f)
+                {
+                    float3 nightBlur = g_night.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.y, N, V) + 3.0f).rgb;
+                    float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
+                    glow = float3(1.0f, 0.70f, 0.38f) * CityLights(nightBlur) * dark * 0.25f;
+                }
+                cloudLight = R * (direct * crevice + ambient * lerp(1.0f, crevice, 0.6f) + glow);
+            }
+        }
+    }
+
     float3 color = albedo * (irradiance * cloudShadow + skylight);
 
-    // Ocean sun glint (normalised Blinn-Phong + Schlick Fresnel for water).
-    float3 H = normalize(L + V);
-    float F = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);
-    const float shininess = 700.0f;
-    float spec = pow(saturate(dot(N, H)), shininess) * (shininess + 8.0f) / (8.0f * PI) * F;
-    color += irradiance * spec * ocean * cloudShadow * (1.0f - cloud);
+    // Ocean sun glitter (Cox & Munk): wind-dependent, broken up by wind patches, slicks and
+    // swell, cut by the shadows of the clouds.
+    if (ocean > 0.01f && NdotL > 0.0f)
+    {
+        float footprint = RayTCurrent() * 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
+        float sigma2 = OceanRoughness(ecef, footprint);
+        color += E * Tsun * SunGlitter(N, V, L, sigma2) * ocean * cloudShadow * (1.0f - cloud);
+    }
 
-    // Clouds: bright, slightly forward-scattering, light wraps a bit past the terminator.
-    float3 cloudLight = (E * SunTransmittance(P + N * CLOUD_HEIGHT) * saturate(NdotL + 0.05f) + skylight * 2.0f) * 0.8f;
-    color = lerp(color, cloudLight, cloud);
+    // Clouds over the ground.
+    color = color * (1.0f - cloud) + cloudLight;
 
     // City lights (NASA Black Marble): keep the warm lights, drop the bluish moonlit terrain.
     if (g_cb.params.z > 0.5f)
     {
         float3 night = g_night.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.y, N, V)).rgb;
-        float lights = saturate((night.r + night.g) * 0.5f - night.b * 0.75f) * 6.0f;
+        float lights = CityLights(night);
         float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
         color += float3(1.0f, 0.70f, 0.38f) * lights * dark * (1.0f - 0.8f * cloud) * 1.5f;
     }

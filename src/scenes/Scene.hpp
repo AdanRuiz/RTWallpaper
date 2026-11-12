@@ -77,6 +77,11 @@ public:
     virtual UINT Update(float dt, float aspect, void* constants, InstanceDef* instances) = 0;
     // Textures that became ready since the last call (e.g. loaded by a background thread).
     virtual void PollTextures(std::vector<TextureUpload>& out) { (void)out; }
+    // Mouse input. Only sent in window mode (never to the wallpaper); SetInteractive(true) is
+    // called right after the scene is created in window mode.
+    virtual void SetInteractive(bool interactive) { (void)interactive; }
+    virtual void OnOrbit(float dxPixels, float dyPixels) { (void)dxPixels; (void)dyPixels; }   // right-button drag
+    virtual void OnZoom(float steps) { (void)steps; }   // wheel / touchpad pinch; > 0 = closer
 };
 
 // Camera basis as consumed by the shaders: position.w = tan(fovY / 2).

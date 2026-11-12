@@ -14,7 +14,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 | # | Requisito | Implementación |
 |---|---|---|
 | R1 | Ray tracing en tiempo real | DXR 1.0: TLAS reconstruido cada frame, rayos primarios, de sombra (eclipses, brillo del Sol) y de reflexión (metal de los satélites, hasta 3 rebotes). |
-| R2 | Física de la luz | Sol direccional con irradiancia que varía con 1/r²; atmósfera de dispersión simple **Rayleigh + Mie** (alturas de escala 8 km y 1.2 km, 100 km de espesor) con la función de Chapman para la transmitancia; reflejo del Sol en el océano (Blinn-Phong normalizado + Fresnel de Schlick para agua); Fresnel metálico en los satélites; luz reflejada por la Tierra (*earthshine*). |
+| R2 | Física de la luz | Sol direccional con irradiancia que varía con 1/r²; atmósfera de dispersión simple **Rayleigh + Mie** (alturas de escala 8 km y 1.2 km, 100 km de espesor) con la función de Chapman para la transmitancia; reflejo del Sol en el océano con el modelo de **Cox-Munk** (pendientes de las olas según el viento, Fresnel del agua; se alarga solo en vistas rasantes y lo moteadan zonas de viento y manchas de calma, cortado por las sombras de las nubes); **destello de lente** (rayos de difracción, halo cromático y fantasmas de colores) y brillo del limbo al amanecer, según la fracción del disco solar visible sobre el limbo y su enrojecimiento; crepúsculo que se apaga de forma exponencial; Fresnel metálico en los satélites; luz reflejada por la Tierra (*earthshine*). |
 | R3 | Texturas 8K | Mapa diurno **NASA Blue Marble Next Generation** y mapa nocturno **NASA Black Marble (VIIRS)**, 8192×4096, descargados de NASA GIBS, con mipmaps completos generados en CPU y nivel de mip elegido por la huella de cada píxel en el suelo. |
 | R4 | Clima actualizado cada hora | Mapa global de nubes en vivo (8192×4096). Un hilo en segundo plano lo consulta **cada 60 min** con `If-None-Match` (ETag) y solo lo descarga si cambió. Proyecta sombras de nubes sobre el suelo. |
 | R5 | Velocidad de los satélites real respecto al planeta dibujado | Todo se dibuja en **kilómetros**: Tierra de 6371 km y satélites a su altitud real. Las órbitas salen de los **TLE actuales de Celestrak** (ISS y Hubble), propagadas con Kepler + J2 en doble precisión y con el reloj UTC real. |
@@ -113,6 +113,10 @@ FocusLat=23.6        ; punto inicial de interés (México)
 FocusLon=-102.5
 FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 Galaxy=scenic        ; scenic | real
+Clouds=layered       ; flat | layered | volumetric (= layered por ahora); ver clouds.md
+CloudRelief=2        ; exageración del relieve de las cimas (layered)
+DevMode=0            ; solo desarrollo: cámara de vista general; en ventana, clic derecho gira y la rueda/pellizco hace zoom
+DevSpinSeconds=90    ; solo desarrollo (DevMode=1): una vuelta cada N s (0 = sin giro extra)
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.
@@ -159,6 +163,9 @@ struct SceneConstantBuffer
     float4 textureInfo;      // x = day width, y = night width, z = cloud width
     float4 galaxyCenter;     // world direction of the galactic centre
     float4 galaxyPole;       // world direction of the galactic north pole
+    float4 cloudInfo;        // x = mode (0 flat, 1 layered), y = cloud-top relief exaggeration
+    float4 sunVisibility;    // rgb = Sun seen by the camera (limb coverage x atmosphere), w = fraction of the disc
+    float4 sunLimb;          // x = glow of the limb when the Sun is just behind it (0..1)
 };
 
 struct RayPayload
@@ -297,8 +304,11 @@ float3 Atmosphere(float3 o, float3 d, float tMax, out float3 transmittance)
 
     float mu = dot(d, g_cb.sunDirection.xyz);
     float phaseR = 3.0f / (16.0f * PI) * (1.0f + mu * mu);
-    const float g = 0.76f;
-    float phaseM = (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f));
+    // Mie: haze (g = 0.76) plus a narrow forward lobe (g = 0.95) for larger aerosols, so the limb
+    // blazes where the Sun is about to rise behind it.
+    const float g = 0.76f, g2 = 0.95f;
+    float phaseM = 0.8f * (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f))
+                 + 0.2f * (1.0f - g2 * g2) / (4.0f * PI * pow(abs(1.0f + g2 * g2 - 2.0f * g2 * mu), 1.5f));
 
     const int HALF = 6;   // 12 samples per view ray
     float odR = 0.0f, odM = 0.0f;
@@ -427,12 +437,67 @@ float3 Sun(float3 d)
     return float3(1.0f, 0.96f, 0.9f) * smoothstep(cos(r * 1.15f), cos(r * 0.85f), cosA) * 2000.0f;
 }
 
-// Lens glare around the Sun (camera effect), only when the Sun is actually visible.
+// Lens glare around the Sun (camera effect). Evaluated over the whole image: it fades smoothly
+// to zero, with no cut-off circle.
 float3 SunGlare(float3 d)
 {
     float r = g_cb.sunInfo.x;
     float a = acos(clamp(dot(d, g_cb.sunDirection.xyz), -1.0f, 1.0f));
-    return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.5f * exp(-a / (r * 40.0f)));
+    return float3(1.0f, 0.95f, 0.88f) * (24.0f * exp(-a / (r * 5.0f)) + 0.35f * exp(-a / (r * 30.0f)));
+}
+
+// Sunrise behind the limb: the thin shell of air at the limb forward-scatters a warm blaze, an
+// arc along the limb centred where the Sun is about to appear. It lives in the air only: rays
+// that pass high above the limb or hit the ground well inside the disc get none of it (otherwise
+// the dark Earth would look transparent).
+float3 LimbGlow(float3 o, float3 d)
+{
+    float b = dot(o, d);
+    float hc = (b < 0.0f ? sqrt(max(dot(o, o) - b * b, 0.0f)) : length(o)) - RE;   // closest approach altitude
+    float shell = hc >= 0.0f ? exp(-hc / 18.0f) : exp(hc / 5.0f);
+    float r = g_cb.sunInfo.x;
+    float a = acos(clamp(dot(d, g_cb.sunDirection.xyz), -1.0f, 1.0f));
+    return float3(1.0f, 0.72f, 0.45f) * shell * (40.0f * exp(-a / (r * 6.0f)) + 2.0f * exp(-a / (r * 40.0f)));
+}
+
+// Lens flare of a multi-element camera lens: star-shaped diffraction spikes and a chromatic halo
+// around the Sun, plus coloured ghost reflections on the line from the Sun through the image
+// centre. p and s are aspect-corrected screen coordinates of the pixel and of the Sun.
+float3 LensFlare(float2 p, float2 s, float2 dimSun)
+{
+    float3 col = 0;
+    float2 v = p - s;
+    float dS = length(v);
+
+    // Diffraction spikes (6-blade aperture) and a faint wide star.
+    float ang = atan2(v.y, v.x);
+    float spikes = pow(abs(cos(ang * 3.0f)), 180.0f) + 0.4f * pow(abs(cos(ang * 3.0f + 0.52f)), 400.0f);
+    col += float3(1.0f, 0.95f, 0.85f) * spikes * exp(-dS / 0.10f) * 6.0f;
+
+    // Chromatic halo: a thin ring, red outside, blue inside.
+    const float haloR = 0.42f;
+    col += float3(exp(-pow((dS - haloR * 1.02f) / 0.012f, 2.0f)),
+                  exp(-pow((dS - haloR) / 0.012f, 2.0f)),
+                  exp(-pow((dS - haloR * 0.98f) / 0.012f, 2.0f))) * 0.18f;
+
+    // Ghosts: position along the Sun -> centre axis (1 = Sun, 0 = centre, < 0 = beyond it).
+    const float  kPos[7] = { 0.55f, 0.28f, -0.18f, -0.42f, -0.72f, -1.0f, -1.35f };
+    const float  kRad[7] = { 0.060f, 0.025f, 0.110f, 0.045f, 0.200f, 0.085f, 0.032f };
+    const float3 kCol[7] = { float3(0.35f, 0.85f, 0.55f), float3(1.0f, 0.65f, 0.30f), float3(0.55f, 0.35f, 1.0f),
+                             float3(0.25f, 0.75f, 1.0f), float3(1.0f, 0.40f, 0.65f), float3(0.60f, 1.0f, 0.45f),
+                             float3(1.0f, 0.85f, 0.55f) };
+    [unroll]
+    for (int i = 0; i < 7; i++)
+    {
+        float d = length(p - s * kPos[i]);
+        float disc = smoothstep(kRad[i], kRad[i] * 0.75f, d);              // soft-edged aperture image
+        float rim = exp(-pow((d - kRad[i]) / (kRad[i] * 0.08f), 2.0f));     // brighter rim
+        float ring = (i == 4) ? 1.0f : 0.0f;                                // one large ring-shaped ghost
+        col += kCol[i] * lerp(disc * 0.5f + rim * 0.35f, rim, ring) * 0.22f;
+    }
+    // Flares fade as the Sun leaves the frame.
+    float onScreen = 1.0f - smoothstep(1.0f, 1.8f, max(abs(dimSun.x), abs(dimSun.y)));
+    return col * onScreen;
 }
 
 // World direction -> galactic coordinates. The frame comes from the constant buffer: either the
@@ -487,12 +552,24 @@ void RayGen()
 
     float3 col = TraceRadiance(g_cb.cameraPosition.xyz, dir, 0);
 
-    // Glare: a shadow ray towards the Sun (hidden behind the Earth => no glare), only for pixels
-    // within ~35 degrees of the Sun where the glare is not negligible.
-    if (dot(dir, g_cb.sunDirection.xyz) > 0.82f)
+    // Glare and lens flare, scaled by how much of the Sun the camera sees: the fraction of the
+    // disc above the Earth's limb, reddened by the air it grazes (computed once per frame on the
+    // CPU, see SpaceScene::SunVisibility). Hidden Sun => no glare, no flare.
+    float3 sunSeen = g_cb.sunVisibility.rgb;
+    if (g_cb.sunLimb.x > 0.001f)
+        col += LimbGlow(g_cb.cameraPosition.xyz, dir) * g_cb.sunLimb.x;
+    if (g_cb.sunVisibility.w > 0.0f)
     {
-        float sunVisible = TraceShadow(g_cb.cameraPosition.xyz, g_cb.sunDirection.xyz);
-        col += SunGlare(dir) * sunVisible * SunTransmittance(g_cb.cameraPosition.xyz);
+        col += SunGlare(dir) * sunSeen;
+        float3 L = g_cb.sunDirection.xyz;
+        float f = dot(L, g_cb.cameraForward.xyz);
+        if (f > 0.05f)
+        {
+            float aspect = float(dim.x) / float(dim.y);
+            float tanH = g_cb.cameraPosition.w;
+            float2 sunNdc = float2(dot(L, g_cb.cameraRight.xyz) / (f * tanH * aspect), dot(L, g_cb.cameraUp.xyz) / (f * tanH));
+            col += LensFlare(ndc * float2(aspect, 1.0f), sunNdc * float2(aspect, 1.0f), sunNdc) * sunSeen;
+        }
     }
 
     col *= 1.0f - 0.12f * dot(ndc * 0.7f, ndc * 0.7f);
@@ -556,6 +633,191 @@ float3 ProceduralAlbedo(float3 ecef, out float ocean)
     return lerp(c, float3(0.75f, 0.78f, 0.82f), ice);
 }
 
+// ---------------------------------------------------------------------------
+// Layered (2.5D) clouds, clouds.md phase C1: cloud-top height estimated from the opacity map,
+// parallax, relief on the tops, long shadows, tops lit after sunset, two-stream light.
+// ---------------------------------------------------------------------------
+static const float CLOUD_TOP_MAX = 12.0f;   // km
+
+float3 WorldFromEarth(float3 v)
+{
+    return g_cb.earthRow[0].xyz * v.x + g_cb.earthRow[1].xyz * v.y + g_cb.earthRow[2].xyz * v.z;
+}
+
+// Cloud-top height (km) estimated from opacity: thin and medium layers stay at 2-4 km, only the
+// densest cores (thunderstorms) climb to 12 km. Read from a coarser mip so towers get rounded
+// tops and their edges taper down.
+float CloudTopKm(float2 uv, float lod)
+{
+    float a = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lod + 1.5f));
+    float k = smoothstep(0.6f, 1.0f, a);
+    return 2.0f + (CLOUD_TOP_MAX - 2.0f) * k * k;
+}
+
+// First crossing of the view ray with the sphere of radius RE + h (the camera is always above).
+float3 RayAtHeight(float3 o, float3 d, float h, float3 fallback)
+{
+    float r = RE + h;
+    float b = dot(o, d);
+    float disc = b * b - (dot(o, o) - r * r);
+    if (disc < 0.0f) return fallback;
+    float t = -b - sqrt(disc);
+    return t > 0.0f ? o + d * t : fallback;
+}
+
+// Fraction of the solar disc above the Earth's limb seen from height h (km) over the unit
+// normal n: the horizon dips by acos(RE / (RE + h)), so high tops stay lit after sunset.
+// The ramp after it dims grazing light: only tower sides face the Sun at the very end of the day.
+float EarthSunVisibility(float3 n, float3 L, float h)
+{
+    float elev = asin(clamp(dot(n, L), -1.0f, 1.0f));
+    float dip = acos(RE / (RE + h));
+    float above = elev + dip;                                  // Sun altitude over this horizon (rad)
+    return smoothstep(-g_cb.sunInfo.x, g_cb.sunInfo.x, above) * (0.3f + 0.7f * saturate(above / 0.1f));
+}
+
+// Shadow cast by clouds on a point at height h0 (km), n = unit ECEF normal, Le = Sun (ECEF).
+// The sun ray reaches height z at horizontal distance s(z) (Earth curvature included:
+// z = h0 + s*tanE + s^2 / 2RE); a cloud there whose top is above z blocks the Sun.
+// Sampling by height level instead of by distance covers both short (high Sun) and
+// hundreds-of-km (grazing Sun) shadows with the same 8 samples.
+float CloudShadowLayered(float3 n, float3 Le, float h0, float lod)
+{
+    float sinE = dot(n, Le);
+    float3 t = Le - n * sinE;
+    float tl = length(t);
+    if (tl < 1e-4f) return 1.0f - 0.75f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(n), lod));
+    t /= tl;
+    float tanE = sinE / tl;
+    float texel = 2.0f * PI * RE / max(g_cb.textureInfo.z, 1.0f);
+    float occ = 0.0f;
+    [loop]
+    for (int k = 0; k < 8; k++)
+    {
+        float z = lerp(h0 + 0.3f, CLOUD_TOP_MAX + 0.5f, (k + 0.5f) / 8.0f);
+        float dz = z - h0;
+        if (dz <= 0.0f) continue;
+        float q = sqrt(tanE * tanE + 2.0f * dz / RE);
+        float s = tanE > 0.0f ? 2.0f * dz / (tanE + q) : RE * (q - tanE);   // stable both ways
+        if (s > 700.0f) break;
+        float ang = s / RE;
+        float3 m = n * cos(ang) + t * sin(ang);                            // great-circle step
+        float2 uvk = LatLonUV(m);
+        float lodK = max(lod, log2(max(s * 0.15f / texel, 1.0f)));         // softer far shadows
+        float a = CloudOpacity(g_clouds.SampleLevel(g_linear, uvk, lodK));
+        float top = CloudTopKm(uvk, lodK);
+        occ = max(occ, a * smoothstep(z - 0.75f, z + 0.75f, top));
+    }
+    return 1.0f - 0.75f * occ;
+}
+
+// Normal of the cloud tops from the height-field gradient (world space).
+float3 CloudTopNormal(float3 N, float3 ecef, float2 uv, float lod)
+{
+    float3 east = cross(WorldFromEarth(float3(0.0f, 0.0f, 1.0f)), N);
+    float el = length(east);
+    if (el < 1e-3f) return N;                                              // poles
+    east /= el;
+    float3 north = cross(N, east);
+    // Gradient of a smoother height (1.5 mips coarser than CloudTopKm's own blur): the tops show
+    // towers and fronts, not foam-like bubbles from texel-level noise in the opacity map.
+    float lodN = lod + 1.5f;
+    float w = max(g_cb.textureInfo.z, 1.0f);
+    float stepU = exp2(lodN + 1.5f) / w;                                   // one coarse texel
+    float stepKm = 2.0f * PI * RE * stepU;
+    float coslat = max(sqrt(saturate(1.0f - ecef.z * ecef.z)), 0.05f);
+    float dE = (CloudTopKm(uv + float2(stepU, 0), lodN) - CloudTopKm(uv - float2(stepU, 0), lodN)) / (2.0f * stepKm * coslat);
+    float dN = (CloudTopKm(uv - float2(0, 2.0f * stepU), lodN) - CloudTopKm(uv + float2(0, 2.0f * stepU), lodN)) / (2.0f * stepKm);
+    float k = g_cb.cloudInfo.y;
+    return normalize(N - k * (dE * east + dN * north));
+}
+
+// Billow noise: |2n - 1| of a smooth value noise. Its highs are round lumps and its zeros sharp
+// creases, which is what cauliflower cloud tops look like; summed over octaves the lumps come in
+// very irregular sizes. Octaves whose features get smaller than ~2 pixels fade out (no shimmer).
+float BillowTops(float3 q, float footprintKm, float baseKm)
+{
+    float s = 0.0f, norm = 0.0f, a = 1.0f, km = baseKm;
+    [unroll]
+    for (int i = 0; i < 3; i++)
+    {
+        float w = a * (1.0f - smoothstep(0.35f, 0.8f, footprintKm / km));
+        s += w * abs(Noise3(q) * 2.0f - 1.0f);
+        norm += a;
+        q = q * 2.07f + float3(3.1f, 7.7f, 1.3f);
+        a *= 0.55f;
+        km *= 0.483f;
+    }
+    return s / norm;
+}
+
+// Cauliflower tops of big, tall, dense cloud masses (cumulonimbus, cumulus congestus). mask
+// selects where they grow. Returns a shading factor (darker in the creases) and the lean of the
+// top normal (ECEF) from the gradient of the billow height, so each lump has a lit side and a
+// side in shadow. The domain is warped a little so the lumps do not line up.
+float CumulusTops(float3 ecef, float footprint, float mask, out float3 tiltEcef)
+{
+    tiltEcef = 0;
+    const float BASE_KM = 28.0f;
+    float3 q = ecef * (RE / BASE_KM);
+    q += (float3(Noise3(q * 0.31f), Noise3(q * 0.31f + 5.2f), Noise3(q * 0.31f + 9.7f)) - 0.5f) * 1.2f;
+    float h0 = BillowTops(q, footprint, BASE_KM);
+
+    float3 east = float3(-ecef.y, ecef.x, 0.0f);
+    float el = length(east);
+    east = el > 1e-4f ? east / el : float3(1.0f, 0.0f, 0.0f);
+    float3 north = cross(ecef, east);
+    const float d = 0.12f;                                   // finite-difference step (base cells)
+    float hE = BillowTops(q + east * d, footprint, BASE_KM);
+    float hN = BillowTops(q + north * d, footprint, BASE_KM);
+    tiltEcef = -((hE - h0) * east + (hN - h0) * north) / d * 0.35f * mask;
+
+    float crease = smoothstep(0.0f, 0.30f, h0);              // 0 in the creases, 1 on the lumps
+    return lerp(1.0f, lerp(0.72f, 1.0f, crease), mask);
+}
+
+// Sun glitter on the sea (Cox & Munk 1954). The surface is a field of facets with Gaussian slopes
+// of variance sigma2; the glint is the share of facets tilted to mirror the Sun towards the
+// camera. Returns radiance per unit of solar irradiance (perpendicular to the Sun), in the same
+// units as albedo * E for the land. Elongated at grazing angles by the geometry itself.
+float SunGlitter(float3 N, float3 V, float3 L, float sigma2)
+{
+    float3 H = normalize(L + V);
+    float cosB = saturate(dot(N, H));                        // facet tilt from the mean surface
+    float cosV = max(dot(N, V), 0.03f);
+    float cos2 = max(cosB * cosB, 1e-4f);
+    float p = exp(-(1.0f - cos2) / cos2 / sigma2) / (PI * sigma2);
+    float F = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);   // Fresnel of water
+    return PI * F * p / (4.0f * cosV * cos2 * cos2);
+}
+
+// Wind over the sea, fixed to the ground. What the glint reveals from orbit is not the waves
+// (metres long) but patches of different roughness: regional wind (calm = tight, bright glint;
+// windy = wide, dull) and slicks / wind rows at 5-50 km, here a warped multi-octave pattern.
+// Returns the slope variance (Cox-Munk: 0.003 + 0.00512 * wind m/s).
+float OceanRoughness(float3 ecef, float footprintKm)
+{
+    float3 q = ecef * RE;                                                  // km
+    float wind = lerp(2.5f, 11.0f, Fbm3(q / 420.0f, 3));                   // m/s, weather-scale patches
+    float3 s = q / 40.0f;
+    s += (float3(Noise3(s * 0.4f), Noise3(s * 0.4f + 4.1f), Noise3(s * 0.4f + 8.3f)) - 0.5f) * 2.0f;
+    float slick = Fbm3(s, 4);
+    float detail = 1.0f - smoothstep(6.0f, 20.0f, footprintKm);           // unresolved => average
+    wind *= lerp(1.0f, lerp(0.35f, 1.25f, smoothstep(0.30f, 0.70f, slick)), detail);
+    return 0.003f + 0.00512f * wind;
+}
+
+float PhaseHG(float mu, float g)
+{
+    return (1.0f - g * g) / (4.0f * PI * pow(abs(1.0f + g * g - 2.0f * g * mu), 1.5f));
+}
+
+// Night-side city lights from the Black Marble map (warm lights only).
+float CityLights(float3 night)
+{
+    return saturate((night.r + night.g) * 0.5f - night.b * 0.75f) * 6.0f;
+}
+
 [shader("closesthit")]
 void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
 {
@@ -584,45 +846,125 @@ void EarthClosestHit(inout RayPayload payload, in EarthAttributes attr)
         albedo = ProceduralAlbedo(ecef, ocean);
     }
 
-    // Live clouds (coverage) and their shadows on the ground.
-    float cloud = 0.0f, cloudShadow = 1.0f;
-    if (g_cb.params.w > 0.5f)
-    {
-        float lodC = TextureLod(g_cb.textureInfo.z, N, V);
-        // The live map is infrared-derived: cold ground and thin cirrus read as partly cloudy.
-        // Keep dense clouds opaque and make thin ones translucent.
-        cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lodC));
-        if (NdotL > 0.0f)
-        {
-            float3 Le = EarthFixed(L);
-            float3 tang = Le - ecef * dot(ecef, Le);
-            float3 ns = normalize(ecef + tang * (CLOUD_HEIGHT / RE) / max(NdotL, 0.1f));
-            cloudShadow = 1.0f - 0.65f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(ns), lodC));
-        }
-    }
-
     // Direct sunlight, attenuated by the atmosphere above this point, plus blue skylight.
     float3 Tsun = SunTransmittance(P);
     float3 irradiance = E * Tsun * saturate(NdotL);
-    float3 skylight = E * float3(0.03f, 0.05f, 0.09f) * saturate(NdotL + 0.15f);
+    // Twilight fades exponentially after sunset (it used to be a linear ramp that hit zero at
+    // -8.6 deg, which read as a dark line on the night side): -2 deg ~ 1/3, -6 deg ~ 1/20,
+    // -12 deg ~ 1/400 of the light at sunset. A faint floor (starlight, airglow) keeps the night
+    // side from being pure black.
+    float twilight = NdotL >= 0.0f ? NdotL + 0.15f : 0.15f * exp(NdotL / 0.035f);
+    float3 skylight = E * (float3(0.03f, 0.05f, 0.09f) * twilight + float3(0.0005f, 0.0006f, 0.0009f));
+
+    // Live clouds. cloud = opacity (hides the ground), cloudLight = light reflected by the
+    // clouds (already weighted by their coverage), cloudShadow = shadow on the ground.
+    float cloud = 0.0f, cloudShadow = 1.0f;
+    float3 cloudLight = 0;
+    if (g_cb.params.w > 0.5f)
+    {
+        float lodC = TextureLod(g_cb.textureInfo.z, N, V);
+        if (g_cb.cloudInfo.x < 0.5f)
+        {
+            // Flat: one layer at CLOUD_HEIGHT. The live map is infrared-derived: cold ground and
+            // thin cirrus read as partly cloudy, so dense clouds stay opaque and thin ones translucent.
+            cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uv, lodC));
+            if (NdotL > 0.0f)
+            {
+                float3 Le = EarthFixed(L);
+                float3 tang = Le - ecef * dot(ecef, Le);
+                float3 ns = normalize(ecef + tang * (CLOUD_HEIGHT / RE) / max(NdotL, 0.1f));
+                cloudShadow = 1.0f - 0.65f * CloudOpacity(g_clouds.SampleLevel(g_linear, LatLonUV(ns), lodC));
+            }
+            cloudLight = (E * SunTransmittance(P + N * CLOUD_HEIGHT) * saturate(NdotL + 0.05f) + skylight * 2.0f) * 0.8f * cloud;
+        }
+        else
+        {
+            // Layered: find where the view ray meets the cloud tops (parallax, 2 iterations).
+            float3 o = WorldRayOrigin();
+            float h = CloudTopKm(uv, lodC);
+            float3 Pc = RayAtHeight(o, D, h, P);
+            float3 ecefC = EarthFixed(normalize(Pc));
+            float2 uvC = LatLonUV(ecefC);
+            h = CloudTopKm(uvC, lodC);
+            Pc = RayAtHeight(o, D, h, P);
+            float3 Nc0 = normalize(Pc);
+            ecefC = EarthFixed(Nc0);
+            uvC = LatLonUV(ecefC);
+            h = CloudTopKm(uvC, lodC);
+
+            cloud = CloudOpacity(g_clouds.SampleLevel(g_linear, uvC, lodC));
+            float3 Le = EarthFixed(L);
+            if (NdotL > -0.05f)
+                cloudShadow = CloudShadowLayered(ecef, Le, 0.0f, lodC);
+
+            // Cauliflower tops only on tall, dense, large cloud masses: high estimated top, opaque
+            // here and over a wide area (8 mips coarser = the mass, not a lone dense pixel).
+            float footprint = RayTCurrent() * 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y)
+                            / max(dot(N, V), 0.2f);
+            float mass = CloudOpacity(g_clouds.SampleLevel(g_linear, uvC, lodC + 3.0f));
+            float towers = smoothstep(4.0f, 10.0f, h) * smoothstep(0.6f, 1.0f, mass) * smoothstep(0.5f, 0.95f, cloud);
+            float3 tilt = 0;
+            float crevice = 1.0f;
+            if (towers > 0.0f)
+            {
+                float3 tiltEcef;
+                crevice = CumulusTops(ecefC, footprint, towers, tiltEcef);
+                tilt = WorldFromEarth(tiltEcef);
+            }
+
+            if (cloud > 0.002f)
+            {
+                // Two-stream reflectance of a cloud slab: optical depth from opacity, g = 0.85.
+                float tau = -log(1.0f - 0.98f * cloud) * 8.0f;
+                float R = 0.15f * tau / (1.0f + 0.15f * tau);
+
+                // Sunlight on the tops: atmosphere above them, the Earth's limb (tops stay lit
+                // after sunset), shadows from taller clouds, and the relief of the tops.
+                float3 Nc = normalize(CloudTopNormal(Nc0, ecefC, uvC, lodC) + tilt);
+                float sunVis = EarthSunVisibility(Nc0, L, h) * CloudShadowLayered(ecefC, Le, h, lodC);
+                float wrap = saturate((dot(Nc, L) + 0.25f) / 1.25f);
+                float3 direct = E * SunTransmittance(Nc0 * (RE + h)) * sunVis * wrap;
+
+                // Phase function: matters for thin clouds (silver lining towards the Sun).
+                float mu = dot(L, D);
+                float phase = 4.0f * PI * (0.7f * PhaseHG(mu, 0.8f) + 0.3f * PhaseHG(mu, -0.3f));
+                direct *= lerp(1.0f, phase, exp(-tau * 0.25f));
+
+                // Ambient: blue sky above, light bounced by the ground below.
+                float3 ambient = skylight * 2.0f + albedo * irradiance * 0.3f;
+
+                // City lights glowing through the clouds at night (blurred, warm).
+                float3 glow = 0;
+                if (g_cb.params.z > 0.5f)
+                {
+                    float3 nightBlur = g_night.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.y, N, V) + 3.0f).rgb;
+                    float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
+                    glow = float3(1.0f, 0.70f, 0.38f) * CityLights(nightBlur) * dark * 0.25f;
+                }
+                cloudLight = R * (direct * crevice + ambient * lerp(1.0f, crevice, 0.6f) + glow);
+            }
+        }
+    }
+
     float3 color = albedo * (irradiance * cloudShadow + skylight);
 
-    // Ocean sun glint (normalised Blinn-Phong + Schlick Fresnel for water).
-    float3 H = normalize(L + V);
-    float F = 0.02f + 0.98f * pow(1.0f - saturate(dot(V, H)), 5.0f);
-    const float shininess = 700.0f;
-    float spec = pow(saturate(dot(N, H)), shininess) * (shininess + 8.0f) / (8.0f * PI) * F;
-    color += irradiance * spec * ocean * cloudShadow * (1.0f - cloud);
+    // Ocean sun glitter (Cox & Munk): wind-dependent, broken up by wind patches, slicks and
+    // swell, cut by the shadows of the clouds.
+    if (ocean > 0.01f && NdotL > 0.0f)
+    {
+        float footprint = RayTCurrent() * 2.0f * g_cb.cameraPosition.w / float(DispatchRaysDimensions().y);
+        float sigma2 = OceanRoughness(ecef, footprint);
+        color += E * Tsun * SunGlitter(N, V, L, sigma2) * ocean * cloudShadow * (1.0f - cloud);
+    }
 
-    // Clouds: bright, slightly forward-scattering, light wraps a bit past the terminator.
-    float3 cloudLight = (E * SunTransmittance(P + N * CLOUD_HEIGHT) * saturate(NdotL + 0.05f) + skylight * 2.0f) * 0.8f;
-    color = lerp(color, cloudLight, cloud);
+    // Clouds over the ground.
+    color = color * (1.0f - cloud) + cloudLight;
 
     // City lights (NASA Black Marble): keep the warm lights, drop the bluish moonlit terrain.
     if (g_cb.params.z > 0.5f)
     {
         float3 night = g_night.SampleLevel(g_linear, uv, TextureLod(g_cb.textureInfo.y, N, V)).rgb;
-        float lights = saturate((night.r + night.g) * 0.5f - night.b * 0.75f) * 6.0f;
+        float lights = CityLights(night);
         float dark = 1.0f - smoothstep(-0.08f, 0.06f, NdotL);
         color += float3(1.0f, 0.70f, 0.38f) * lights * dark * (1.0f - 0.8f * cloud) * 1.5f;
     }
@@ -884,6 +1226,10 @@ public:
         double focusLon = -102.5;
         double focusMinutes = 20;      // minutes over the focus point before following the ISS; < 0 = always
         bool galaxyReal = false;       // true: real galactic orientation; false: "scenic", band kept in view
+        int cloudMode = 1;             // 0 = flat (original), 1 = layered 2.5D (clouds.md phase C1)
+        float cloudRelief = 2.0f;      // exaggeration of the cloud-top relief (layered)
+        bool devMode = false;          // developer: overview camera (orbit/zoom with the mouse in a window)
+        double devSpinSeconds = 90;    // developer: one Earth turn every N s in devMode (0 = no extra spin)
         double timeOffsetHours = 0;    // show the Earth at another time (0 = now)
     };
 
@@ -899,6 +1245,9 @@ private:
         DirectX::XMFLOAT4 textureInfo;    // x = day width, y = night width, z = cloud width
         DirectX::XMFLOAT4 galaxyCenter;   // world direction of the galactic centre
         DirectX::XMFLOAT4 galaxyPole;     // world direction of the galactic north pole
+        DirectX::XMFLOAT4 cloudInfo;      // x = mode (0 flat, 1 layered), y = cloud-top relief exaggeration
+        DirectX::XMFLOAT4 sunVisibility;  // rgb = Sun seen by the camera (limb x atmosphere), w = visible fraction
+        DirectX::XMFLOAT4 sunLimb;        // x = glow of the limb when the Sun is just behind it (0..1)
     };
 
     struct Shared
@@ -911,8 +1260,10 @@ private:
 
     static constexpr float FOV_Y = 45.0f;
     static constexpr double REFOLLOW_PERIOD = 1500.0;  // s, camera altitude cycle
+    static constexpr double DEV_ALTITUDE = 13450.0;    // km: the whole disc fills ~85 % of the height
 
     Settings m_settings;
+    std::wstring m_iniPath;
     std::shared_ptr<Shared> m_shared;
     double m_startUnix = 0;
     double m_simSeconds = 0;
@@ -920,15 +1271,28 @@ private:
     float m_textureWidth[3] = {};
     float m_lastPitch = 0.0f;
     astro::Vec3 m_galaxyCenter{}, m_galaxyPole{};   // smoothed scenic galaxy frame
+    astro::Vec3 m_sunDir{ 1, 0, 0 };                 // world, towards the Sun (this frame)
+
+    // Developer overview camera (DevMode): orbit angles in a frame tied to the Sun (yaw 0 = looking
+    // at the terminator from the side, pitch = towards the north pole), altitude above the surface.
+    // Targets follow the mouse; the current values ease towards them. Saved in devcamera.ini.
+    bool m_interactive = false;
+    double m_spinOffset = 0;                         // extra Earth rotation (rad) on top of GMST
+    double m_yaw = 0, m_pitch = 20 * astro::DEG, m_alt = DEV_ALTITUDE;
+    double m_yawT = 0, m_pitchT = 20 * astro::DEG, m_altT = DEV_ALTITUDE;
+    double m_saveTimer = 0;
+    bool m_devDirty = false;
 
 public:
-    explicit SpaceScene(const std::wstring& iniPath)
+    explicit SpaceScene(const std::wstring& iniPath) : m_iniPath(iniPath)
     {
         LoadSettings(iniPath);
         FILETIME ft;
         GetSystemTimePreciseAsFileTime(&ft);
         ULARGE_INTEGER u = { { ft.dwLowDateTime, ft.dwHighDateTime } };
         m_startUnix = (double)(u.QuadPart - 116444736000000000ULL) / 1e7 + m_settings.timeOffsetHours * 3600.0;
+
+        if (m_settings.devMode) LoadDevState();
 
         m_shared = std::make_shared<Shared>();
         // Fallback orbits until fresh TLEs arrive (real elements, epoch 2026-11-11).
@@ -941,7 +1305,31 @@ public:
         std::thread(Worker, m_shared, m_settings).detach();
     }
 
-    ~SpaceScene() override { m_shared->stop = true; }
+    ~SpaceScene() override
+    {
+        m_shared->stop = true;
+        if (m_interactive && m_settings.devMode) SaveDevState();
+    }
+
+    void SetInteractive(bool interactive) override { m_interactive = interactive; }
+
+    // Right-button drag: the planet follows the mouse. Slower when close to the surface.
+    void OnOrbit(float dx, float dy) override
+    {
+        if (!m_settings.devMode) return;
+        const double perPixel = 0.0035 * std::clamp(m_altT / 15000.0 + 0.08, 0.08, 1.0);
+        m_yawT -= dx * perPixel;
+        m_pitchT = std::clamp(m_pitchT + dy * perPixel, -85.0 * astro::DEG, 85.0 * astro::DEG);
+        m_devDirty = true;
+    }
+
+    // Wheel / touchpad pinch: each step brings the camera 15 % closer to the surface.
+    void OnZoom(float steps) override
+    {
+        if (!m_settings.devMode) return;
+        m_altT = std::clamp(m_altT * std::pow(0.85, (double)steps), 500.0, 60000.0);
+        m_devDirty = true;
+    }
 
     const wchar_t* Name() const override { return L"space"; }
     D3D12_SHADER_BYTECODE Library() const override { return { g_pSpace, sizeof(g_pSpace) }; }
@@ -999,7 +1387,13 @@ public:
         }
 
         // --- Earth orientation: world -> ECEF (rotation by GMST around the pole) ---
-        const double theta = astro::Gmst(now);
+        // Developer spin: extra rotation so the whole planet passes by in DevSpinSeconds.
+        if (m_settings.devMode && m_settings.devSpinSeconds > 0)
+        {
+            m_spinOffset = std::fmod(m_spinOffset + 2 * astro::PI * dt / m_settings.devSpinSeconds, 2 * astro::PI);
+            m_devDirty = true;
+        }
+        const double theta = astro::Gmst(now) + (m_settings.devMode ? m_spinOffset : 0.0);
         const float c = (float)std::cos(theta), s = (float)std::sin(theta);
         cb.earthRow[0] = XMFLOAT4(c, 0, -s, 0);
         cb.earthRow[1] = XMFLOAT4(-s, 0, -c, 0);
@@ -1009,6 +1403,7 @@ public:
         const Vec3 sunEci = astro::SunPositionEci(now);
         const double sunDist = sunEci.Length();
         const Vec3 sunDir = astro::EciToWorld(sunEci).Normalized();
+        m_sunDir = sunDir;
         cb.sunDirection = XMFLOAT4((float)sunDir.x, (float)sunDir.y, (float)sunDir.z,
                                    (float)(20.0 * (astro::AU / sunDist) * (astro::AU / sunDist)));
         cb.sunInfo = XMFLOAT4((float)std::asin(astro::SUN_RADIUS / sunDist), (float)sunDist, 0.16f, 0);
@@ -1038,6 +1433,35 @@ public:
                 { (float)(x.z * k), (float)(y.z * k), (float)(z.z * k), (float)satPos[i].z },
             };
             memcpy(inst.transform, m, sizeof(m));
+        }
+
+        // --- Developer overview: orbit camera around the planet (mouse in window mode) ---
+        if (m_settings.devMode)
+        {
+            const double k = 1.0 - std::exp(-std::max(dt, 0.0f) * 10.0);       // ease towards the targets
+            m_yaw += (m_yawT - m_yaw) * k;
+            m_pitch += (m_pitchT - m_pitch) * k;
+            m_alt += (m_altT - m_alt) * k;
+            if (m_interactive && m_devDirty && (m_saveTimer += dt) > 2.0)
+            {
+                SaveDevState();
+                m_saveTimer = 0;
+                m_devDirty = false;
+            }
+
+            const Vec3 pole{ 0, 1, 0 };                                        // world +Y = Earth's axis
+            Vec3 side = astro::Cross(pole, sunDir);                            // 90 deg from the Sun
+            side = side.Length() < 1e-6 ? Vec3{ 1, 0, 0 } : side.Normalized();
+            const Vec3 night = astro::Cross(pole, side);                       // away from the Sun
+            const Vec3 horiz = side * std::cos(m_yaw) + night * std::sin(m_yaw);
+            const Vec3 camDir = (horiz * std::cos(m_pitch) + pole * std::sin(m_pitch)).Normalized();
+            const Vec3 cam = camDir * (astro::EARTH_RADIUS + m_alt);
+            const Vec3 fwd = (camDir * -1.0).Normalized();
+            const Vec3 up = (pole - fwd * astro::Dot(pole, fwd)).Normalized();
+            cb.camera = MakeCameraDir(XMVectorSet((float)cam.x, (float)cam.y, (float)cam.z, 0),
+                                      XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
+                                      XMVectorSet((float)up.x, (float)up.y, (float)up.z, 0));
+            return FinishConstants(cb, cam, fwd, up);
         }
 
         // --- Observer ---
@@ -1108,13 +1532,63 @@ public:
                                   XMVectorSet((float)fwd.x, (float)fwd.y, (float)fwd.z, 0), FOV_Y,
                                   XMVectorSet((float)camDir.x, (float)camDir.y, (float)camDir.z, 0));
 
-        UpdateGalaxyFrame(fwd, camDir, cb);
-        cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
-        cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
-        return sizeof(Constants);
+        return FinishConstants(cb, cam, fwd, camDir);
     }
 
 private:
+    UINT FinishConstants(Constants& cb, const astro::Vec3& cam, const astro::Vec3& fwd, const astro::Vec3& upHint)
+    {
+        using DirectX::XMFLOAT4;
+        UpdateGalaxyFrame(fwd, upHint, cb);
+        SunVisibility(cam, cb);
+        cb.params = XMFLOAT4((float)m_simSeconds, m_hasTexture[0], m_hasTexture[1], m_hasTexture[2]);
+        cb.textureInfo = XMFLOAT4(m_textureWidth[0], m_textureWidth[1], m_textureWidth[2], 0);
+        cb.cloudInfo = XMFLOAT4((float)m_settings.cloudMode, m_settings.cloudRelief, 0, 0);
+        return sizeof(Constants);
+    }
+
+    // The Sun as the camera sees it, once per frame (the shader no longer traces a shadow ray per
+    // pixel for the glare): the fraction of the solar disc above the Earth's limb, and the colour
+    // of its light after grazing the atmosphere (orange-red when it rises or sets behind the limb).
+    void SunVisibility(const astro::Vec3& cam, Constants& cb) const
+    {
+        using astro::Vec3;
+        const double R = astro::EARTH_RADIUS;
+        const double d = cam.Length();
+        const Vec3 toEarth = cam * (-1.0 / d);
+        const double cosT = std::clamp(astro::Dot(m_sunDir, toEarth), -1.0, 1.0);
+        const double theta = std::acos(cosT);                       // Sun <-> Earth centre, seen from the camera
+        const double rhoE = std::asin(std::min(1.0, (R + 5.0) / d)); // the lowest ~5 km of air is opaque edge-on
+        const double rhoS = std::max((double)cb.sunInfo.x, 1e-6);
+        // Covered part of the disc: circular segment behind a (locally straight) limb.
+        const double x = std::clamp((theta - rhoE) / rhoS, -1.0, 1.0);
+        const double vis = 1.0 - (std::acos(x) - x * std::sqrt(1.0 - x * x)) / astro::PI;
+
+        // Grazing height of the camera -> Sun ray and the optical depth of that tangent path
+        // through an exponential atmosphere: tau = beta * H * sqrt(2 pi (R + h) / H) * exp(-h / H).
+        const double along = cosT * d;                               // distance to the closest approach
+        const double hT = std::max((along > 0 ? (cam + m_sunDir * along).Length() : d) - R, 0.0);
+        auto tau = [&](double beta, double H) {
+            return beta * H * std::sqrt(2.0 * astro::PI * (R + hT) / H) * std::exp(-hT / H);
+        };
+        const double mie = tau(4.40e-3, 1.2);
+        const double tr = std::exp(-(tau(5.802e-3, 8.0) + mie));
+        const double tg = std::exp(-(tau(13.558e-3, 8.0) + mie));
+        const double tb = std::exp(-(tau(33.1e-3, 8.0) + mie));
+        // Glare and flare follow the visible fraction perceptually (a sliver of Sun is still a
+        // blinding point: a camera saturates long before the disc is whole), and the reddening
+        // is softened (sqrt) so a rising Sun stays a vivid orange star instead of fading out.
+        const double seen = std::pow(vis, 0.35);
+        cb.sunVisibility = DirectX::XMFLOAT4((float)(std::sqrt(tr) * seen), (float)(std::sqrt(tg) * seen),
+                                             (float)(std::sqrt(tb) * seen), (float)vis);
+
+        // Sunrise / sunset behind the limb: for the last ~2 degrees before the Sun appears (and
+        // while it is partly covered) the air at the limb scatters a blaze of forward light.
+        const double behind = std::max(rhoE - theta, 0.0);          // how far the Sun centre is behind the limb
+        const double glow = (1.0 - vis) * std::exp(-behind / (0.8 * astro::DEG));
+        cb.sunLimb = DirectX::XMFLOAT4((float)glow, 0, 0, 0);
+    }
+
     static constexpr double DAY_LIMIT = 78.0 * astro::DEG;   // max observer distance from the subsolar point
 
     // Galactic frame for the sky. Real: galactic north pole RA 192.86 Dec +27.13, centre RA 266.40
@@ -1213,6 +1687,14 @@ private:
         m_settings.focusMinutes = _wtof(buf);
         GetPrivateProfileStringW(sec, L"Galaxy", L"scenic", buf, 64, ini.c_str());
         m_settings.galaxyReal = _wcsicmp(buf, L"real") == 0;
+        // Clouds: flat | layered | volumetric (volumetric = layered until phase C3 exists).
+        GetPrivateProfileStringW(sec, L"Clouds", L"layered", buf, 64, ini.c_str());
+        m_settings.cloudMode = _wcsicmp(buf, L"flat") == 0 ? 0 : 1;
+        GetPrivateProfileStringW(sec, L"CloudRelief", L"2", buf, 64, ini.c_str());
+        m_settings.cloudRelief = std::clamp((float)_wtof(buf), 0.0f, 10.0f);
+        m_settings.devMode = GetPrivateProfileIntW(sec, L"DevMode", 0, ini.c_str()) != 0;
+        GetPrivateProfileStringW(sec, L"DevSpinSeconds", L"90", buf, 64, ini.c_str());
+        m_settings.devSpinSeconds = std::clamp(_wtof(buf), 0.0, 86400.0);
     }
 
     // -----------------------------------------------------------------------
@@ -1229,6 +1711,44 @@ private:
         dir += L"\\cache";
         CreateDirectoryW(dir.c_str(), nullptr);
         return dir + L"\\";
+    }
+
+    // Developer camera state: devcamera.ini next to RTWallpaper.ini (a separate file, so saving it
+    // never reloads the scene; each copy of the app keeps its own view).
+    // EarthAngle is the absolute rotation (GMST + spin): the planet reappears as it was left.
+    std::wstring DevStatePath() const
+    {
+        return m_iniPath.substr(0, m_iniPath.find_last_of(L"\\/") + 1) + L"devcamera.ini";
+    }
+
+    void LoadDevState()
+    {
+        const std::wstring path = DevStatePath();
+        if (!FileExists(path)) return;
+        wchar_t buf[64];
+        auto get = [&](const wchar_t* key, double def) {
+            GetPrivateProfileStringW(L"DevCamera", key, L"", buf, 64, path.c_str());
+            return buf[0] ? _wtof(buf) : def;
+        };
+        m_yaw = m_yawT = get(L"Yaw", 0.0);
+        m_pitch = m_pitchT = std::clamp(get(L"Pitch", 20 * astro::DEG), -85.0 * astro::DEG, 85.0 * astro::DEG);
+        m_alt = m_altT = std::clamp(get(L"Altitude", DEV_ALTITUDE), 500.0, 60000.0);
+        const double angle = get(L"EarthAngle", 1e9);
+        if (angle < 1e8) m_spinOffset = std::fmod(angle - astro::Gmst(m_startUnix), 2 * astro::PI);
+    }
+
+    void SaveDevState() const
+    {
+        const std::wstring path = DevStatePath();
+        auto put = [&](const wchar_t* key, double v) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"%.6f", v);
+            WritePrivateProfileStringW(L"DevCamera", key, buf, path.c_str());
+        };
+        put(L"Yaw", m_yawT);
+        put(L"Pitch", m_pitchT);
+        put(L"Altitude", m_altT);
+        put(L"EarthAngle", std::fmod(astro::Gmst(m_startUnix + m_simSeconds) + m_spinOffset, 2 * astro::PI));
     }
 
     static bool FileExists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
@@ -1874,6 +2394,11 @@ public:
     virtual UINT Update(float dt, float aspect, void* constants, InstanceDef* instances) = 0;
     // Textures that became ready since the last call (e.g. loaded by a background thread).
     virtual void PollTextures(std::vector<TextureUpload>& out) { (void)out; }
+    // Mouse input. Only sent in window mode (never to the wallpaper); SetInteractive(true) is
+    // called right after the scene is created in window mode.
+    virtual void SetInteractive(bool interactive) { (void)interactive; }
+    virtual void OnOrbit(float dxPixels, float dyPixels) { (void)dxPixels; (void)dyPixels; }   // right-button drag
+    virtual void OnZoom(float steps) { (void)steps; }   // wheel / touchpad pinch; > 0 = closer
 };
 
 // Camera basis as consumed by the shaders: position.w = tan(fovY / 2).

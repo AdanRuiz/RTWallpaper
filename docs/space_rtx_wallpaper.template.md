@@ -14,7 +14,7 @@ Este documento contiene la especificación y código fuente completo (HLSL y C++
 | # | Requisito | Implementación |
 |---|---|---|
 | R1 | Ray tracing en tiempo real | DXR 1.0: TLAS reconstruido cada frame, rayos primarios, de sombra (eclipses, brillo del Sol) y de reflexión (metal de los satélites, hasta 3 rebotes). |
-| R2 | Física de la luz | Sol direccional con irradiancia que varía con 1/r²; atmósfera de dispersión simple **Rayleigh + Mie** (alturas de escala 8 km y 1.2 km, 100 km de espesor) con la función de Chapman para la transmitancia; reflejo del Sol en el océano (Blinn-Phong normalizado + Fresnel de Schlick para agua); Fresnel metálico en los satélites; luz reflejada por la Tierra (*earthshine*). |
+| R2 | Física de la luz | Sol direccional con irradiancia que varía con 1/r²; atmósfera de dispersión simple **Rayleigh + Mie** (alturas de escala 8 km y 1.2 km, 100 km de espesor) con la función de Chapman para la transmitancia; reflejo del Sol en el océano con el modelo de **Cox-Munk** (pendientes de las olas según el viento, Fresnel del agua; se alarga solo en vistas rasantes y lo moteadan zonas de viento y manchas de calma, cortado por las sombras de las nubes); **destello de lente** (rayos de difracción, halo cromático y fantasmas de colores) y brillo del limbo al amanecer, según la fracción del disco solar visible sobre el limbo y su enrojecimiento; crepúsculo que se apaga de forma exponencial; Fresnel metálico en los satélites; luz reflejada por la Tierra (*earthshine*). |
 | R3 | Texturas 8K | Mapa diurno **NASA Blue Marble Next Generation** y mapa nocturno **NASA Black Marble (VIIRS)**, 8192×4096, descargados de NASA GIBS, con mipmaps completos generados en CPU y nivel de mip elegido por la huella de cada píxel en el suelo. |
 | R4 | Clima actualizado cada hora | Mapa global de nubes en vivo (8192×4096). Un hilo en segundo plano lo consulta **cada 60 min** con `If-None-Match` (ETag) y solo lo descarga si cambió. Proyecta sombras de nubes sobre el suelo. |
 | R5 | Velocidad de los satélites real respecto al planeta dibujado | Todo se dibuja en **kilómetros**: Tierra de 6371 km y satélites a su altitud real. Las órbitas salen de los **TLE actuales de Celestrak** (ISS y Hubble), propagadas con Kepler + J2 en doble precisión y con el reloj UTC real. |
@@ -113,6 +113,10 @@ FocusLat=23.6        ; punto inicial de interés (México)
 FocusLon=-102.5
 FocusMinutes=20      ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 Galaxy=scenic        ; scenic | real
+Clouds=layered       ; flat | layered | volumetric (= layered por ahora); ver clouds.md
+CloudRelief=2        ; exageración del relieve de las cimas (layered)
+DevMode=0            ; solo desarrollo: cámara de vista general; en ventana, clic derecho gira y la rueda/pellizco hace zoom
+DevSpinSeconds=90    ; solo desarrollo (DevMode=1): una vuelta cada N s (0 = sin giro extra)
 ```
 
 Cualquier cambio en `[Space]` recrea la escena al guardar el archivo. Los mapas se cargan de la caché en pocos segundos.

@@ -26,7 +26,7 @@ Escena `space` como fondo de escritorio en una configuración de dos monitores (
 | Escena | Diseño | Qué hay |
 |---|---|---|
 | `marble` | [`ray_tracing_windows_desktop_wallpaper.md`](ray_tracing_windows_desktop_wallpaper.md) | Piso de mármol negro con reflexión Fresnel y sombras; 3 esferas de cuarzo exactas con refracción de Snell, reflexión interna total y absorción de Beer; 2 luces de neón; movimiento con OpenSimplex2 ([FastNoiseLite](https://github.com/Auburn/FastNoiseLite)). |
-| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km)**, con la Vía Láctea al fondo (nubes estelares violetas, nebulosas H-alfa rojas y grietas de polvo oscuro): mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara empieza mirando hacia México y luego sigue a la ISS; siempre mantiene la Tierra en el 40–60 % de la pantalla. |
+| `space` | [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md) | **La Tierra real, ahora y a escala real (km)**, con la Vía Láctea al fondo (nubes estelares violetas, nebulosas H-alfa rojas y grietas de polvo oscuro): mapas 8K de la NASA (Blue Marble día / Black Marble noche), **nubes reales** (se consultan cada hora), rotación terrestre y posición del Sol según el reloj UTC (distancia ≈ 1 UA), atmósfera física Rayleigh + Mie, reflejo del Sol en el océano (Cox-Munk), destello de lente y amanecer en el limbo, luces de ciudades. **ISS y Hubble** en sus órbitas reales (TLE de Celestrak, Kepler + J2: 7.65 km/s, 92.9 min). La cámara empieza mirando hacia México y luego sigue a la ISS; siempre mantiene la Tierra en el 40–60 % de la pantalla. |
 
 La escena `space` descarga sus datos la primera vez (~30 MB, unos 45 s) en `%LOCALAPPDATA%\RTWallpaper\cache` y después funciona también sin conexión. Los detalles están en [`space_rtx_wallpaper.md`](space_rtx_wallpaper.md).
 
@@ -73,6 +73,10 @@ FocusLat=23.6             ; punto inicial que mira la cámara (México)
 FocusLon=-102.5
 FocusMinutes=20           ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 Galaxy=scenic             ; scenic (Vía Láctea siempre a la vista) | real (orientación astronómica)
+Clouds=layered            ; flat (capa plana original) | layered (nubes 2.5D: altura, relieve, sombras largas) | volumetric (= layered por ahora)
+CloudRelief=2             ; exageración del relieve de las cimas en layered (0 = sin relieve)
+DevMode=0                 ; solo desarrollo: cámara de vista general (todo el planeta); en modo ventana ver abajo
+DevSpinSeconds=90         ; solo desarrollo, con DevMode=1: una vuelta de la Tierra cada N s (0 = sin giro extra)
 ```
 
 También puedes cambiar de escena desde el icono de la bandeja (modo fondo) o con **Tab** (modo ventana).
@@ -96,6 +100,17 @@ En modo `--wallpaper`:
 ### Con Lively Wallpaper (opcional)
 
 Como en el documento original: en Lively, **Add Wallpaper → Browse** y elige `RTWallpaper.exe` (sin argumentos).
+
+### Modo desarrollador (`DevMode=1`)
+
+Cámara de vista general para revisar el planeta entero, con las nubes de día y de noche. La Tierra da una vuelta cada `DevSpinSeconds` segundos.
+
+En **modo ventana** (`RTWallpaper.exe --scene space`):
+
+* **clic derecho + arrastrar:** gira alrededor del planeta;
+* **rueda del ratón o pellizco del touchpad:** zoom, de 500 km a 60 000 km de altura.
+
+La vista (ángulos, distancia y giro de la Tierra) se guarda en `devcamera.ini`, junto a `RTWallpaper.ini`, y se recupera en el siguiente arranque. Como fondo de pantalla, la cámara no responde al ratón: usa la última vista guardada.
 
 ## Estructura
 

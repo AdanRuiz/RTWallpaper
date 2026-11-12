@@ -119,7 +119,16 @@ static const char kDefaultIni[] =
     "FocusLon=-102.5\r\n"
     "FocusMinutes=20\r\n"
     "; Milky Way orientation: scenic (always in view) | real (astronomical)\r\n"
-    "Galaxy=scenic\r\n";
+    "Galaxy=scenic\r\n"
+    "; Clouds: flat (original flat layer) | layered (2.5D: height, relief, long shadows) | volumetric (= layered for now)\r\n"
+    "Clouds=layered\r\n"
+    "; Exaggeration of the cloud-top relief in layered mode (0 = none)\r\n"
+    "CloudRelief=2\r\n"
+    "; Developer only: overview camera seeing the whole planet. In window mode, right-drag rotates\r\n"
+    "; and the wheel / touchpad pinch zooms; the view is saved for the next start.\r\n"
+    "DevMode=0\r\n"
+    "; Developer only (DevMode=1): one full Earth turn every N seconds (0 = no extra spin)\r\n"
+    "DevSpinSeconds=90\r\n";
 
 static std::wstring ConfigPath()
 {
@@ -785,6 +794,8 @@ struct App
     bool userPaused = false;
     bool running = true;
     bool resizePending = false;
+    bool dragging = false;       // right button held (window mode): orbit the camera
+    POINT dragPos = {};
 };
 static App g_app;
 
@@ -808,6 +819,8 @@ static void SwitchScene(const std::wstring& name)
 {
     g_app.scene.reset();   // stop the old scene's background work first
     g_app.scene = CreateScene(name, g_app.configPath);
+    g_app.scene->SetInteractive(!g_app.wallpaper);
+    g_app.dragging = false;
     g_app.sceneSection = ReadSection(g_app.scene->Name());
     g_app.instances.assign(g_app.scene->InstanceCount(), InstanceDef{});
     memset(g_app.constants, 0, sizeof(g_app.constants));
@@ -880,6 +893,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_app.config.scene = kSceneNames[next];
             SwitchScene(kSceneNames[next]);
         }
+        return 0;
+    // Mouse: window mode only (the wallpaper sits behind the desktop icons and never gets input).
+    // A precision-touchpad pinch arrives as WM_MOUSEWHEEL with MK_CONTROL; it zooms like the wheel.
+    case WM_RBUTTONDOWN:
+        if (!g_app.wallpaper)
+        {
+            SetCapture(hwnd);
+            g_app.dragging = true;
+            g_app.dragPos = { (short)LOWORD(lp), (short)HIWORD(lp) };
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_app.dragging && g_app.scene)
+        {
+            POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            g_app.scene->OnOrbit((float)(p.x - g_app.dragPos.x), (float)(p.y - g_app.dragPos.y));
+            g_app.dragPos = p;
+        }
+        return 0;
+    case WM_RBUTTONUP:
+        if (g_app.dragging) { g_app.dragging = false; ReleaseCapture(); }
+        return 0;
+    case WM_CAPTURECHANGED:
+        g_app.dragging = false;
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (!g_app.wallpaper && g_app.scene)
+            g_app.scene->OnZoom((float)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA);
         return 0;
     case WM_DISPLAYCHANGE:
         RefitToDesktop();

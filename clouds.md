@@ -1,6 +1,8 @@
 # Nubes con volumen: versión híbrida (escena `space`)
 
-> Especificación, no implementada todavía. Versión viable en tiempo real de [`2d_to_3d_volumetric_cloud_pipeline.md`](2d_to_3d_volumetric_cloud_pipeline.md): el mismo objetivo, nubes reales con volumen a partir de datos de satélite, pero con el volumen calculado solo donde se ve. Sustituye a la fase 3 de [`relief.md`](relief.md) (nubes con altura), que pasa a ser la capa 2.5D de este documento.
+> **Estado:** fase **C1 implementada** (`Clouds=layered`, por defecto); C2–C4 pendientes. `Clouds=volumetric` se comporta como `layered` hasta que exista C3.
+>
+> Especificación. Versión viable en tiempo real de [`2d_to_3d_volumetric_cloud_pipeline.md`](2d_to_3d_volumetric_cloud_pipeline.md): el mismo objetivo, nubes reales con volumen a partir de datos de satélite, pero con el volumen calculado solo donde se ve. Sustituye a la fase 3 de [`relief.md`](relief.md) (nubes con altura), que pasa a ser la capa 2.5D de este documento.
 
 ## 1. Por qué híbrida
 
@@ -37,7 +39,9 @@ El pipeline original hace 64 pasos de volumen más 4×64 hacia el Sol en todos l
 
 ### 3.1 Mapa del tiempo (*weather map*)
 
-Una textura equirectangular (misma convención de UV que `LatLonUV`) con **`R8G8_UNORM`**, en el slot actual de nubes (t3):
+Una textura equirectangular (misma convención de UV que `LatLonUV`) con **`R8G8_UNORM`**, en el slot actual de nubes (t3).
+
+> **Implementación de C1:** la textura sigue siendo `R8` (solo opacidad). La altura se estima **en el shader** (`CloudTopKm`) leyendo la opacidad en un mip 1.5 niveles más grueso, que suaviza las cimas y afila los bordes sin preprocesado en la CPU: `h = 2 + 10·k²` km con `k = smoothstep(0.6, 1, a)`, así que solo los núcleos más densos llegan a 12 km. El canal G se añade con C2. El relieve de las cimas se controla con `CloudRelief` (exageración, 2 por defecto). Las **masas grandes, altas y densas** (cumulonimbos, cúmulos congestus) reciben **cimas de coliflor**: ruido *billow* (|2n − 1| de un ruido suave, 3 octavas desde 28 km, con el dominio deformado) fijo al suelo. Da bultos redondeados de tamaños muy irregulares con pliegues entre ellos; su gradiente inclina la normal de la cima (un lado iluminado y otro en sombra) y los pliegues se oscurecen. Solo se aplica donde la cima estimada es alta, la nube es opaca y la zona opaca es amplia (un mip 8 veces más grueso); las nubes pequeñas o finas siguen lisas. Cada octava se apaga cuando sus bultos miden menos de ~2 píxeles, así que de lejos no hay parpadeo. Un primer intento con ruido celular (Voronoi) se descartó: dibujaba polígonos, como un caparazón. Coste medido en la RTX 4060 Laptop: de ~34 % a ~37 % de GPU (≈1 ms por frame).
 
 | Canal | Contenido | Origen |
 |---|---|---|
@@ -166,6 +170,7 @@ Clouds=volumetric         ; flat | layered | volumetric
 CloudTopSource=estimate   ; estimate (desde la opacidad) | satellite (fase C2, §3.2)
 CloudSteps=32             ; máximo de pasos del volumen (6–64)
 CloudDetail=1             ; erosión con ruido 3D (0 = formas suaves, más barato)
+CloudRelief=2             ; exageración del relieve de las cimas en layered (0 = sin relieve)
 CloudDebug=0              ; 1 = colorea el peso del volumen w (rojo) sobre la imagen
 ```
 
