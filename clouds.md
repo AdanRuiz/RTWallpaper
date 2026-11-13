@@ -123,9 +123,15 @@ En `EarthClosestHit`, sustituyendo la capa plana actual:
 * **Paralaje:** el punto de la cima visto desde la cámara está desplazado `h·tan(θ)` respecto al suelo. Se corrige la UV de la nube con 2 iteraciones de *parallax mapping*. Así las nubes altas cerca del borde se separan de su sombra.
 
 ### 5.2 Sombras largas
-* Marcha de 8 pasos (de 2 km a `min(700 km, 16 km / tan(e))`, exponencial) hacia el Sol sobre el weather map.
+* Marcha de 9 muestras hacia el Sol sobre el weather map (`CloudOcclusion`), más una lectura justo encima del punto. Van en dos tramos: 5 repartidas por igual hasta donde llega la sombra de las nubes bajas (2 km, casi todas) y 4 con paso cuadrático hasta el alcance de las torres de 12 km, con tope de 700 km. Cada muestra lee un mip tan grueso como la separación con sus vecinas: no se salta ninguna nube y las sombras lejanas salen con penumbra.
 * Una nube a distancia `s` hace sombra si su cima es mayor que `s·tan(e) + s²/(2·RE)`.
-* Se aplica a la sombra sobre el suelo y a la sombra sobre las cimas de otras nubes (una torre sobre la capa baja de al lado).
+* **Estiramiento (`CloudShadowLength`, por defecto 4):** el mapa de nubes tiene texeles de ~5 km. La sombra física de una nube de 2 km mide `2 km / tan(e)`: menos de un texel con el Sol a más de 22°, así que queda escondida bajo la propia nube y solo asoma a pocos grados del terminador. Para que se vea a esta escala, la altura de las nubes sobre el punto sombreado se multiplica por este factor solo al calcular la sombra (la forma y el paralaje de la nube no cambian). `1` = físico; `0` = solo la sombra justo debajo de la nube.
+* Se aplica a tres cosas, con distinta fuerza:
+  * **suelo:** la luz directa baja hasta un 75 % (la luz del cielo queda);
+  * **reflejo del Sol en el mar:** es una imagen especular del Sol, muchas veces más brillante que el blanco, así que una nube en medio lo apaga casi del todo, `(1 − 0.98·occ)³`. Con el 75 % de la sombra difusa seguiría saturado y la sombra no se vería;
+  * **bruma del aire (`AIR_SHADOW = 0.5`):** el aire que queda en sombra bajo la nube tampoco dispersa luz del Sol. Aproximadamente la mitad de la luz del aire viene de debajo de las cimas (`1 − exp(−z/HR)` de la columna de Rayleigh y casi toda la calima). Sobre el mar oscuro, casi todo el color es esa bruma: sin esto la sombra sobre el océano no se ve.
+* **Opacidad para la sombra (`ShadowOpacity`):** el mapa viene del infrarrojo: el suelo frío se lee como un velo tenue y las nubes bajas y cálidas como medio transparentes. Para la sombra se usa `smoothstep(0.08, 0.6, opacidad)`: el velo casi no oscurece y cualquier nube claramente visible tapa casi toda la luz directa.
+* También da sombra sobre las cimas de otras nubes (una torre sobre la capa baja de al lado), hasta un 45 %, **sin estirar** y con transición ancha (3 km): las alturas son estimadas, y estiradas o con transición estrecha dibujan manchas grises de bordes duros sobre las capas.
 
 ### 5.3 Composición
 `color = mezcla(suelo · sombra_nubes, luz_nube, a)`. La luz de la nube es la de §4 con la normal de la cima. Las luces nocturnas se atenúan con `exp(−τ)`, como hoy.
@@ -198,7 +204,7 @@ RTX 4060 Laptop, 2560×1440 + 1920×1080 a 30 FPS. Hoy la escena usa ~35 % de GP
 
 | Parte | Píxeles afectados | Coste |
 |---|---|---|
-| Capa 2.5D: forma, paralaje, sombras de 8 pasos | Tierra visible (~3.5 M) | 0.5–1 ms |
+| Capa 2.5D: forma, paralaje, sombras de 9 muestras | Tierra visible (~3.5 M) | 0.5–1 ms |
 | Volumen en el limbo y la silueta | ~10–20 % (0.4–0.7 M) × ~20 pasos × (1 + 3 de luz en los que tienen nube) | 1.5–3 ms |
 | **Total** | | **2–4 ms** |
 | Con `relief.md` (fases 1–2) | | +1–2 ms |

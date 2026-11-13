@@ -24,7 +24,8 @@ gh attestation verify RTWallpaper-win-x64.zip -R AdanRuiz/RTWallpaper
 >
 > * **Posiciones aproximadas:** el Sol usa una efeméride de baja precisión; la ISS y el Hubble se propagan con Kepler + J2 (no SGP4), así que su posición se desvía varios km por día desde la época del TLE, y más si no hay conexión. La hora sale del reloj de tu PC.
 > * **Nubes y tiempo atmosférico:** el mapa de nubes es un compuesto de terceros que se actualiza cada hora (puede tener horas de retraso); la altura de las nubes es una **estimación visual** a partir de su opacidad, no una medición, y las cimas de coliflor son ruido procedural.
-> * **Superficie:** las texturas de la NASA son mosaicos de referencia, no imágenes del día; el viento y las manchas del océano que se ven en el reflejo del Sol son inventados.
+> * **Superficie:** las texturas de la NASA son mosaicos de referencia, no imágenes del día; el viento del océano que da forma al reflejo del Sol es inventado.
+> * **Relámpagos, sprites, jets gigantes y elves:** son un efecto visual, no eventos reales ni una predicción. Aparecen al azar sobre las nubes más densas del lado nocturno.
 > * **Luz y atmósfera:** modelos simplificados (dispersión simple, sin refracción) con ajustes artísticos (destello de lente, brillo del limbo, exposición).
 >
 > Se ofrece tal cual, sin garantía de ningún tipo.
@@ -103,8 +104,12 @@ FocusLat=23.6             ; punto inicial que mira la cámara (México)
 FocusLon=-102.5
 FocusMinutes=20           ; minutos sobre ese punto antes de seguir a la ISS (-1 = siempre)
 Galaxy=scenic             ; scenic (Vía Láctea siempre a la vista) | real (orientación astronómica)
+GalaxyBrightness=1        ; brillo de la Vía Láctea (menos = más transparente, 0 = solo estrellas)
 Clouds=layered            ; flat (capa plana original) | layered (nubes 2.5D: altura, relieve, sombras largas) | volumetric (= layered por ahora)
 CloudRelief=2             ; exageración del relieve de las cimas en layered (0 = sin relieve)
+CloudShadowLength=4       ; largo de las sombras de las nubes en layered (1 = físico, 0 = solo bajo la nube)
+SunGlint=2.5              ; brillo del reflejo del Sol en el mar (1 = físico, 0 = sin reflejo)
+Sprites=1                 ; relámpagos, sprites, jets y elves sobre las tormentas de noche: frecuencia (0 = sin efecto)
 DevMode=0                 ; solo desarrollo: cámara de vista general (todo el planeta); en modo ventana ver abajo
 DevSpinSeconds=90         ; solo desarrollo, con DevMode=1: una vuelta de la Tierra cada N s (0 = sin giro extra)
 ```
