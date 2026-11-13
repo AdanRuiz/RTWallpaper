@@ -120,10 +120,21 @@ static const char kDefaultIni[] =
     "FocusMinutes=20\r\n"
     "; Milky Way orientation: scenic (always in view) | real (astronomical)\r\n"
     "Galaxy=scenic\r\n"
+    "; Brightness of the Milky Way: 1 = as designed, lower = fainter and more see-through, 0 = stars only\r\n"
+    "GalaxyBrightness=1\r\n"
     "; Clouds: flat (original flat layer) | layered (2.5D: height, relief, long shadows) | volumetric (= layered for now)\r\n"
     "Clouds=layered\r\n"
     "; Exaggeration of the cloud-top relief in layered mode (0 = none)\r\n"
     "CloudRelief=2\r\n"
+    "; Length of the cloud shadows in layered mode: 1 = physical (hidden under the cloud unless the\r\n"
+    "; Sun is very low), 4 = stretched so they show at this scale, 0 = only right under the cloud\r\n"
+    "CloudShadowLength=4\r\n"
+    "; Brightness of the Sun's reflection on the sea: 1 = physical (Cox-Munk; dull unless seen at a\r\n"
+    "; grazing angle), 2.5 = as in photos from orbit, 0 = off\r\n"
+    "SunGlint=2.5\r\n"
+    "; Lightning, sprites, gigantic jets and elves over the storms on the night side. Not real\r\n"
+    "; events: an effect placed on the densest clouds. Frequency multiplier, 0 = off\r\n"
+    "Sprites=1\r\n"
     "; Developer only: overview camera seeing the whole planet. In window mode, right-drag rotates\r\n"
     "; and the wheel / touchpad pinch zooms; the view is saved for the next start.\r\n"
     "DevMode=0\r\n"
@@ -971,6 +982,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         if (!_wcsicmp(argv[i], L"--wallpaper") || !_wcsicmp(argv[i], L"/wallpaper")) g_app.wallpaper = true;
         else if (!_wcsicmp(argv[i], L"--stop")) stop = true;
         else if (!_wcsicmp(argv[i], L"--debug")) debug = true;
+        else if (!_wcsicmp(argv[i], L"--dev")) g_forceDevMode = true;
         else if (!_wcsicmp(argv[i], L"--fps") && i + 1 < argc) fpsOverride = std::max(1, _wtoi(argv[++i]));
         else if (!_wcsicmp(argv[i], L"--scene") && i + 1 < argc) sceneOverride = argv[++i];
     }
